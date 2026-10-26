@@ -1355,6 +1355,7 @@ struct Engine {
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
+    int nbuf = 2;   // staging buffers: 2 double-buffer the PCIe copy under the compute, 1 serialises them
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -1513,6 +1514,20 @@ struct Engine {
             mq_h = dalloc((size_t) ne * FF);
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
+        {   // the buffers that scale with the context, and what is left for them
+            size_t fr2 = 0, tot2 = 0;
+            CK(cudaMemGetInfo(&fr2, &tot2));
+            const size_t kv_layer = (size_t) g.n_head_kv * ctx * g.head_dim * (kv_q8 ? 1 : 4) +
+                                    (kv_q8 ? (size_t) g.n_head_kv * ctx * sizeof(float2) : 0);
+            const size_t n_kv = 2 * (m->has_mtp ? 1 : 0) + 2 * (size_t) [&] { size_t n = 0; for (const Layer& L : m->layers) if (L.attn) ++n; return n; }();
+            std::fprintf(stderr, "strata-q36: buffers: KV %s %.2f GiB (%zu rows x %d cells), att_s %.2f, att_p16 %.2f, "
+                                 "k16+v16 %.2f, mq_gu %.2f, mq_h %.2f GiB; free now %.2f GiB\n",
+                         kv_q8 ? "int8" : "fp32", (double) kv_layer * n_kv / 1073741824.0, (size_t) g.n_head_kv * ctx, ctx,
+                         (double) kAttScoreFloats * 4 / 1073741824.0, (double) kAttScoreFloats * 2 / 1073741824.0,
+                         (double) 2 * (size_t) g.n_head_kv * ctx * g.head_dim * 2 / 1073741824.0,
+                         (double) (size_t) (int64_t) T * Kp * 2 * FF * 4 / 1073741824.0,
+                         (double) (size_t) (int64_t) T * Kp * FF * 4 / 1073741824.0, (double) fr2 / 1073741824.0);
+        }
         {
             std::string gerr;
             int64_t big = 0;
@@ -1544,10 +1559,20 @@ struct Engine {
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        // The split-K path runs only for T <= kGemmT rows (a bigger batch takes the FP16 GEMM path), so the partials
+        // only ever cover n_head * kGemmT query rows: sizing them for the prompt's T cost 0.50 GiB at 128k for rows
+        // that cannot be reached.
+        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, (int64_t) kGemmT));
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
+        {
+            size_t fr2 = 0, tot2 = 0;
+            CK(cudaMemGetInfo(&fr2, &tot2));
+            std::fprintf(stderr, "strata-q36: attention partials: %d rows x %d chunks x %d = %.2f GiB; free now %.2f GiB\n",
+                         att_rows, n_chunk, g.head_dim,
+                         (double) (size_t) att_rows * n_chunk * g.head_dim * 4 / 1073741824.0, (double) fr2 / 1073741824.0);
+        }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
@@ -2318,10 +2343,10 @@ struct Engine {
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
-        for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+        for (int i = 0; i < nbuf && i < (int) seq.size(); ++i) stream_kick(i);
     }
-    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
-        const int b = i % 2;
+    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % nbuf, after its last reader
+        const int b = i % nbuf;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
@@ -2359,14 +2384,14 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: the expert stream is out of step (layer %d)\n", li);
             std::exit(1);
         }
-        const int b = stream_pos % 2;
+        const int b = stream_pos % nbuf;
         CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
         return stage[b];
     }
     void stream_done() {
-        const int b = stream_pos % 2;
+        const int b = stream_pos % nbuf;
         CK(cudaEventRecord(ev_used[b], st));
-        if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
+        if (stream_pos + nbuf < (int) stream_seq.size()) stream_kick(stream_pos + nbuf);
         ++stream_pos;
     }
 
@@ -3053,9 +3078,19 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.main_hybrid = !mtp_only;
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
-    E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
+    // The streamed prompt path stages a whole layer's experts per buffer.  Two double-buffer the PCIe copy under the
+    // compute; one serialises them - slower than the pair, but far ahead of the CPU expert pool.  Take the pair when
+    // the VRAM the weights, the context and the sessions left can carry it, fall back to one, and to no stream at all
+    // when even one does not fit: that is the path STRATA_Q36_NO_MMQ takes, so it stays a tested one.
+    const size_t one_buf = max_layer + kMmqTail;
+    const size_t stream_reserve = (size_t) 64 << 20;   // the CPU part's outputs and the slots, on top of the staging
+    E.nbuf = 0;
+    if (E.use_mmq && E.main_hybrid)
+        E.nbuf = fr >= 2 * one_buf + stream_reserve ? 2 : (fr >= one_buf + stream_reserve ? 1 : 0);
+    if (E.use_mmq && E.main_hybrid && E.nbuf == 0) E.use_mmq = false;   // no buffers: the native grouped kernels
+    E.hybrid_t = std::max(1, std::min(hybrid_t, E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    const size_t staging = (size_t) E.nbuf * one_buf;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -3147,7 +3182,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < E.nbuf; ++b) {
             CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
             CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
@@ -3164,9 +3199,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
+                 "staging in %d buffer%s); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
-                 (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+                 (double) staging / (1 << 30), E.nbuf, E.nbuf == 1 ? "" : "s", ms_since(t0) / 1000.0);
     return true;
 #endif
 }
