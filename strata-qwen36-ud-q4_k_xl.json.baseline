@@ -1,0 +1,47 @@
+{
+ "exe": "/home/me/Strata/engine-cuda12/strata",
+ "args": [
+  "--native",
+  "/home/me/Strata-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "--max-context",
+  "131072",
+  "--prefill",
+  "auto",
+  "--mtp",
+  "2",
+  "--vision"
+ ],
+ "cwd": "/home/me/Strata",
+ "tokenizer": "/home/me/Strata-data/packs/qwen36-ud-q4_k_xl/tokenizer",
+ "model_name": "qwen3.6-35b-a3b-ud-q4_k_xl",
+ "arch": "qwen35moe",
+ "log": "/home/me/Strata/strata-qwen36-ud-q4_k_xl.log",
+ "lib_dirs": [
+  "/usr/bin",
+  "/usr/lib64"
+ ],
+ "port": 8080,
+ "cuda": 12,
+ "gpu": 0,
+ "gpus_asked": true,
+ "open_browser": false,
+ "vision": {
+  "exe": "/home/me/Strata/engine-cuda12/strata-vision",
+  "mmproj": "/home/me/Strata-data/models/qwen36-UD-Q4_K_XL/mmproj-F16.gguf",
+  "model": "/home/me/Strata-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "gpu": false,
+  "max_tokens": 300,
+  "threads": 6
+ },
+ "args_written": [
+  "--native",
+  "/home/me/Strata-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "--max-context",
+  "131072",
+  "--prefill",
+  "auto",
+  "--mtp",
+  "2",
+  "--vision"
+ ]
+}
