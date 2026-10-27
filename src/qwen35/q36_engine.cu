@@ -17,6 +17,7 @@
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -95,6 +96,11 @@ __device__ float block_sum(float v, float* sh) {
     const float r = sh[0];
     __syncthreads();
     return r;
+}
+/// A warp's sum, in registers: 5 shuffles, no shared memory and no barrier.
+__device__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
 }
 __device__ float block_max(float v, float* sh) {
     sh[threadIdx.x] = v;
@@ -357,7 +363,12 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
                             int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
-    const int c = blockIdx.x, row = blockIdx.y;
+    // The head is the grid's fast axis (the launch site pairs it with blockIdx.x).  This was tried as a fix for
+    // decode-at-depth: the H/HKV = 8 query heads of one KV head read the same K and V, blocks launch x-first, and the
+    // 2 MB of L2 on a Pascal card is far too small to bridge 375 blocks, so the layout looked like 8x the traffic.
+    // It measured neutral (attn 3851 ms vs 3813 ms over 25 steps at 96k), so it is not the cost.  Kept because the
+    // coalesced K read below wants blocks of one head adjacent, and it costs nothing.
+    const int row = blockIdx.x, c = blockIdx.y;
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
@@ -378,21 +389,37 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
     // sum of the query's dims: the affine dequantisation pulls out of the K dot product,
     //   sum_i q[i] * (code[i] * s + m)  ==  s * sum_i q[i] * code[i]  +  m * sum_i q[i]
     const float sumq = Q8 ? block_sum(qs[j], sh) : 0.f;
-    const int p = p0 + j;
-    float s = -INFINITY;
-    if (p < npos) {
+    // K's dot products, one warp per cell.  The one-thread-per-cell layout that the softmax and the V sum below use
+    // walks a cell's 256 dims in that thread, so a warp's 32 lanes read 32 rows 256 bytes apart: 32 sectors fetched for
+    // 32 bytes used, 32x the traffic.  Measured at 96k context: 154 ms of a 189 ms decode step.  A warp taking one
+    // cell reads its 256 contiguous bytes (8 dims per lane) in 8 full sectors; the block's 8 warps take 8 cells a pass.
+    const int warp = j >> 5, lane = j & 31;
+    for (int it = 0; it < kChunkCells / 8; ++it) {
+        const int cell = it * 8 + warp, pc = p0 + cell;
         float a = 0.f;
-        if (Q8) {
-            const int8_t* kp = kc8 + ((size_t) kvh * ctx + p) * HD;
-            const float2 ks = ksc[(size_t) kvh * ctx + p];
-            for (int i = 0; i < HD; ++i) a += qs[i] * (float) kp[i];
-            a = a * ks.x + sumq * ks.y;
-        } else {
-            const float* kp = kc + ((size_t) kvh * ctx + p) * HD;
-            for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
+        if (pc < npos) {
+            if (Q8) {
+                const int8_t* kp = kc8 + ((size_t) kvh * ctx + pc) * HD + lane * 8;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) a += qs[lane * 8 + i] * (float) kp[i];
+                a *= ksc[(size_t) kvh * ctx + pc].x;   // the cell's scale is uniform, so it factors out of the warp
+            } else {
+                const float* kp = kc + ((size_t) kvh * ctx + pc) * HD + lane * 8;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) a += qs[lane * 8 + i] * kp[i];
+            }
         }
-        s = a * scale;
+        const float dot = warp_sum(a);   // every lane calls it: a shuffle needs the whole warp
+        // The affine dequant's offset is a constant of the cell, so it goes in once, after the reduction.  Adding it to
+        // each lane's partial (as the one-thread-per-cell layout did) counts it 32 times: a per-cell error of
+        // 31 * sumq * scale.y * scale, up to 0.025 on a score, which exp() turns into 2.6% on the attention output -
+        // enough to make generation collapse into repetition.  tools/attn_test.cu checks this kernel against a CPU
+        // reference; that error is what it caught, and the same layout now passes at 3.8e-07 relative.
+        if (lane == 0) sc[cell] = Q8 ? (dot + sumq * ksc[(size_t) kvh * ctx + pc].y) * scale : dot * scale;
     }
+    __syncthreads();
+    const int p = p0 + j;
+    const float s = p < npos ? sc[j] : -INFINITY;
     const float m = block_max(s, sh);
     const float e = p < npos ? expf(s - m) : 0.f;
     sc[j] = e;
@@ -1491,6 +1518,7 @@ struct Engine {
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
+        prof.on = std::getenv("STRATA_Q36_PROFILE") != nullptr;   // the decode-stage breakdown, on demand
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
                    MMQ::fits(L.L.d_type, g.n_embd);
@@ -1681,6 +1709,191 @@ struct Engine {
         pos = 0;
         sess[(size_t) cur].pos = 0;
         set_delta(0);
+    }
+
+    // ---- a parked conversation (--conversation-cache-mib): the running state and the KV of the tokens the
+    // conversation holds, in host RAM, so several conversations can take turns.
+    //
+    // This family keeps its recurrent state in one fixed-size buffer per GDN layer (S[l] = ssm_v_heads x
+    // ssm_state_size^2, and the causal conv's history), so a conversation's whole state is a snapshot of a few tens
+    // of MiB whatever its length: restoring it is a copy, not a rewind.  That is what makes parking and mounting
+    // possible at all - the live session's state cannot step back, but a snapshot can be put back wholesale.
+    //
+    // The policy (budget, LRU, matching, borrowing a shared prefix) is strata core's ConversationCache: it is
+    // header-only, CPU-only and stores the payloads as byte buffers, so this engine uses it as it stands.
+
+    /// The bytes a parked conversation of `L` tokens takes: its KV plus its fixed-size running state.
+    size_t conv_image_bytes(int64_t L) const {
+        const auto& g = m->g;
+        size_t gd, tl, pl;
+        conv_state_bytes(gd, tl, pl);
+        const size_t esz = kv_q8 ? 1 : sizeof(float);
+        size_t n_kv = 0;
+        for (size_t l = 0; l < sess[(size_t) cur].kc8.size(); ++l) if (sess[(size_t) cur].kc8[l] || sess[(size_t) cur].kc[l]) ++n_kv;
+        const size_t per_layer = (size_t) L * (size_t) g.n_head_kv * (size_t) g.head_dim * esz * 2 +
+                                 (kv_q8 ? (size_t) L * (size_t) g.n_head_kv * sizeof(float2) * 2 : 0);
+        return gd + tl + pl + n_kv * per_layer;
+    }
+
+    /// The running state's bytes: the GDN state and conv history of every GDN layer, and the last hidden state (the
+    /// decode graph's input).  Fixed-size: independent of the context, which is what makes a snapshot cheap.
+    void conv_state_bytes(size_t& gdn, size_t& tails, size_t& ple) const {
+        const auto& g = m->g;
+        gdn = tails = 0;
+        ple = (size_t) g.n_embd * sizeof(float);
+        for (const Layer& L : m->layers)
+            if (!L.attn) {
+                gdn += (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * sizeof(float);
+                tails += (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * sizeof(float);
+            }
+    }
+
+    /// The cache's rows are [kvh][ctx][head_dim]; a parked image holds the first `upto` positions of each row,
+    /// [kvh][upto][head_dim].  Within one kvh the two layouts line up element for element, so every contiguous run
+    /// of the parked buffer is one straight copy at a fixed device offset - no staging buffer, no transpose.
+    /// False on a transfer error; the caller then leaves the session alone.
+    static bool conv_copy(strata::core::ConversationBuffer& buf, size_t row_bytes, size_t pitch,
+                          void* dev, cudaMemcpyKind dir) {
+        if (!dev || row_bytes == 0 || buf.size() % row_bytes != 0) return false;
+        for (size_t at = 0; at < buf.size(); at += row_bytes) {
+            const size_t h = at / row_bytes, n = std::min(row_bytes, buf.size() - at);
+            const bool ok = buf.visit(at, n, [&](uint8_t* p, size_t cnt, size_t off) {
+                const size_t inner = off - at;
+                char* d = (char*) dev + h * pitch + inner;
+                if (dir == cudaMemcpyDeviceToHost) return cudaMemcpy(p, d, cnt, dir) == cudaSuccess;
+                return cudaMemcpy(d, p, cnt, dir) == cudaSuccess;
+            });
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /// The running state of session `s` as bytes: the GDN state and conv history of every GDN layer, and the last
+    /// hidden state.  Shared by the live snapshot and every turn-boundary checkpoint.
+    bool conv_state_read(int s, strata::core::ConversationCheckpoint& cp) const {
+        const auto& g = m->g;
+        const Sess& ss = sess[(size_t) s];
+        size_t gd, tl, pl;
+        conv_state_bytes(gd, tl, pl);
+        cp.gdn.resize(gd); cp.tails.resize(tl); cp.ple.resize(pl);
+        size_t og = 0, ot = 0;
+        for (size_t l = 0; l < m->layers.size(); ++l) {
+            if (m->layers[l].attn) continue;
+            const size_t nb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * sizeof(float);
+            const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * sizeof(float);
+            if (cudaMemcpy(cp.gdn.data() + og, ss.S[l], nb, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            if (cudaMemcpy(cp.tails.data() + ot, ss.conv[l], cb, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            og += nb; ot += cb;
+        }
+        if (cudaMemcpy(cp.ple.data(), ss.hlast, pl, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        cp.ids = ss.live;
+        // The rotary offset a mount has to put back.  A checkpoint has no field of its own, and block_pos is this
+        // family's unused running-state slot, so it carries the four bytes.
+        cp.block_pos.assign((const uint8_t*) &ss.rdelta, (const uint8_t*) &ss.rdelta + sizeof(ss.rdelta));
+        return true;
+    }
+
+    /// Snapshot session `s` into `img`: its tokens, its running state, and the KV of the tokens it holds.
+    void conv_save(int s, strata::core::SavedConversation& img) const {
+        const auto& g = m->g;
+        const Sess& ss = sess[(size_t) s];
+        const int64_t L = (int64_t) ss.live.size();
+        img.geometry = {(int64_t) ctx, (int64_t) m->layers.size(), kv_q8 ? 1 : 0, (int64_t) ss.rdelta,
+                        (int64_t) ss.pos, g.n_head_kv, g.head_dim, g.ssm_v_heads, g.ssm_state_size,
+                        g.ssm_conv_channels, g.ssm_d_conv, g.n_embd, (int64_t) L, 0, 0, 0, 0, 0};
+        img.cvec = false;   // this family has no context vectors; best() is asked with false
+        if (!conv_state_read(s, img.live)) { img.live.gdn.clear(); return; }
+        const size_t HD = (size_t) g.head_dim, HK = (size_t) g.n_head_kv;
+        const size_t esz = kv_q8 ? 1 : sizeof(float);
+        for (size_t l = 0; l < ss.kc8.size(); ++l) {
+            const bool q8 = ss.kc8[l] != nullptr, f32 = ss.kc[l] != nullptr;
+            if (!q8 && !f32) continue;   // a GDN layer: no cache of its own
+            strata::core::ConversationKv kv;
+            kv.format = kv_q8 ? 1 : 0;
+            kv.cells = L; kv.heads = (int64_t) HK; kv.head_dim = (int64_t) HD;
+            const size_t row = (size_t) L * HD * esz, prow = (size_t) ctx * HD * esz;
+            kv.k.resize(row * HK); kv.v.resize(row * HK);
+            if (!conv_copy(kv.k, row, prow, q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], cudaMemcpyDeviceToHost) ||
+                !conv_copy(kv.v, row, prow, q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], cudaMemcpyDeviceToHost)) {
+                img.kv.clear();
+                return;
+            }
+            if (q8) {   // the int8 rows carry a per-row affine scale (float2) per kv head and position
+                const size_t srow = (size_t) L * sizeof(float2), sprow = (size_t) ctx * sizeof(float2);
+                kv.k_scale.resize(srow * HK); kv.v_scale.resize(srow * HK);
+                if (!conv_copy(kv.k_scale, srow, sprow, ss.ksc[l], cudaMemcpyDeviceToHost) ||
+                    !conv_copy(kv.v_scale, srow, sprow, ss.vsc[l], cudaMemcpyDeviceToHost)) {
+                    img.kv.clear();
+                    return;
+                }
+            }
+            img.kv.push_back(std::move(kv));
+        }
+    }
+
+    /// Put a parked conversation into session `s`, as it stood at `snap`: the KV rows of its first `upto` tokens,
+    /// then the running state recorded there, then the bookkeeping a live session carries (its tokens, its position,
+    /// its rotary offset).  Validated before any transfer, so a foreign image cannot leave a half-written session.
+    /// `snap` is the live state for the conversation going on, or a turn-boundary checkpoint for a conversation that
+    /// branches off a shared start - and, what matters in practice, for a client whose re-rendered history no longer
+    /// reproduces the tokens the engine generated: the divergence costs the tail after `upto`, not the whole prompt.
+    bool conv_restore(const strata::core::SavedConversation& img, int s, int64_t upto,
+                      const strata::core::ConversationCheckpoint& snap) {
+        const auto& g = m->g;
+        Sess& ss = sess[(size_t) s];
+        const size_t HD = (size_t) g.head_dim, HK = (size_t) g.n_head_kv;
+        const size_t esz = kv_q8 ? 1 : sizeof(float);
+        size_t gd, tl, pl;
+        conv_state_bytes(gd, tl, pl);
+        size_t n_kv = 0;
+        for (size_t l = 0; l < ss.kc8.size(); ++l) if (ss.kc8[l] || ss.kc[l]) ++n_kv;
+        if (upto <= 0 || upto > (int64_t) img.live.ids.size() || (int64_t) upto > ctx
+            || snap.ids.size() != (size_t) upto
+            || img.geometry[0] != (int64_t) ctx || img.geometry[1] != (int64_t) m->layers.size()
+            || img.geometry[2] != (kv_q8 ? 1 : 0) || img.geometry[5] != g.n_head_kv || img.geometry[6] != g.head_dim
+            || img.geometry[7] != g.ssm_v_heads || img.geometry[8] != g.ssm_state_size
+            || img.geometry[9] != g.ssm_conv_channels || img.geometry[10] != g.ssm_d_conv
+            || img.geometry[11] != g.n_embd || !img.live.imgs.empty() || !ss.imgs.empty()
+            || snap.gdn.size() != gd || snap.tails.size() != tl || snap.ple.size() != pl
+            || img.kv.size() != n_kv) return false;
+        CK(cudaStreamSynchronize(st));
+        const size_t row = (size_t) upto * HD * esz, prow = (size_t) ctx * HD * esz;
+        size_t li = 0;
+        for (size_t l = 0; l < ss.kc8.size(); ++l) {
+            const bool q8 = ss.kc8[l] != nullptr, f32 = ss.kc[l] != nullptr;
+            if (!q8 && !f32) continue;
+            const strata::core::ConversationKv& kv = img.kv[li++];
+            if (kv.format != (kv_q8 ? 1 : 0) || kv.heads != (int64_t) HK || kv.head_dim != (int64_t) HD
+                || kv.cells < upto) return false;
+            const bool ok = conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.k), row, prow,
+                                      q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], cudaMemcpyHostToDevice) &&
+                            conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.v), row, prow,
+                                      q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], cudaMemcpyHostToDevice);
+            if (!ok) return false;
+            if (q8) {
+                const size_t srow = (size_t) upto * sizeof(float2), sprow = (size_t) ctx * sizeof(float2);
+                if (!conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.k_scale), srow, sprow, ss.ksc[l],
+                               cudaMemcpyHostToDevice) ||
+                    !conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.v_scale), srow, sprow, ss.vsc[l],
+                               cudaMemcpyHostToDevice)) return false;
+            }
+        }
+        size_t og = 0, ot = 0;
+        for (size_t l = 0; l < m->layers.size(); ++l) {
+            if (m->layers[l].attn) continue;
+            const size_t nb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * sizeof(float);
+            const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * sizeof(float);
+            if (cudaMemcpy(ss.S[l], snap.gdn.data() + og, nb, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            if (cudaMemcpy(ss.conv[l], snap.tails.data() + ot, cb, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            og += nb; ot += cb;
+        }
+        if (cudaMemcpy(ss.hlast, snap.ple.data(), pl, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+        ss.live.assign(snap.ids.begin(), snap.ids.end());
+        ss.pos = (int32_t) upto;
+        // The rotary offset travels with the state it was taken at (see conv_state_read).
+        ss.rdelta = snap.block_pos.size() == sizeof(ss.rdelta) ? *(const int32_t*) snap.block_pos.data() : 0;
+        if (s == cur) { pos = (int64_t) upto; set_delta(ss.rdelta); }
+        return true;
     }
 
     /// y [T][n_out] = W x [T][n_in] on the native MMVQ, 8 columns per launch.
@@ -2037,6 +2250,56 @@ struct Engine {
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
+    /// STRATA_Q36_PROFILE=1: where a decode step's time goes, by stage.  CUDA events delimit each group of kernels in
+    /// call order and are read at the mark: one stream, so an elapsed time is that group's own.  Decode steps only - a
+    /// prompt chunk's cost is the expert streaming it was sized for, and adding the two answers nothing.  Reading at
+    /// every mark serialises the step, which at 286 ms a token is not a measurement worth refusing.  The counts
+    /// self-report and reset, so it is cheap enough to leave compiled in and off.
+    struct Prof {
+        bool on = false;
+        cudaEvent_t a = nullptr, b = nullptr;
+        double ms[6] = {};   // 0 attention core, 1 GDN core, 2 experts, 3 embed, 4 head, 5 the MTP block
+        long n = 0;
+        int64_t depth = 0;
+        static constexpr long kReport = 25;
+        void begin(cudaStream_t s, int64_t pos) {
+            if (!a) {
+                cudaEventCreate(&a);
+                cudaEventCreate(&b);
+            }
+            depth = pos;
+            cudaEventRecord(a, s);
+        }
+        void mark(int stage, cudaStream_t s) {
+            cudaEventRecord(b, s);
+            cudaEventSynchronize(b);
+            float dt = 0.0f;
+            cudaEventElapsedTime(&dt, a, b);
+            ms[stage] += dt;
+            std::swap(a, b);   // this mark's end is the next region's start
+        }
+        void report() {
+            ++n;
+            if (n % kReport != 0) return;
+            double tot = 0;
+            for (double v : ms) tot += v;
+            std::fprintf(stderr, "strata-q36: profile: %ld decode steps at %lld cells: attn %.1f ms, GDN %.1f ms, "
+                                 "experts %.1f ms, embed %.1f ms, head %.1f ms, MTP draft %.1f ms = %.1f ms/token "
+                                 "(%.2f tok/s)\n",
+                         n, (long long) depth, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], tot,
+                         tot > 0 ? 1000.0 / tot : 0.0);
+            std::fflush(stderr);
+            for (double& v : ms) v = 0;
+            n = 0;
+        }
+    };
+    Prof prof;
+    bool in_mtp = false;   // the MTP block's own layer must not land in the main model's buckets
+    /// A stage boundary, decode steps only.
+    void pmark(int stage, int T, bool verify) {
+        if (prof.on && T == 1 && !verify && !in_mtp) prof.mark(stage, st);
+    }
+
     void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
                const float* wn, float* hout) {
         const auto& g = m->g;
@@ -2085,6 +2348,7 @@ struct Engine {
                 }
             }
             mm(L.ssm_out, gdn_y, y, T);
+            pmark(1, T, verify);   // the GDN core ends here; the experts of this layer follow
         } else {
             prep_in(T);
             apply(L.wq, xq, qg, T);
@@ -2163,7 +2427,7 @@ struct Engine {
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
                     (kv_q8 ? k_attn_part<true> : k_attn_part<false>)
-                        <<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                        <<<dim3(nt * H, nc), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                   rows_mode ? nullptr : vc[li],
                                                                   rows_mode ? nullptr : kc8[li],
                                                                   rows_mode ? nullptr : vc8[li],
@@ -2174,6 +2438,7 @@ struct Engine {
                 }
             }
             mm(L.wo, att, y, T);
+            pmark(0, T, verify);   // the attention core ends here; the experts of this layer follow
         }
         add_rms_post(L, T);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -2249,6 +2514,7 @@ struct Engine {
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
+        pmark(2, T, verify);   // this layer's experts end here; the next layer's core follows
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -2257,6 +2523,8 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        const bool pf = prof.on && T == 1 && !verify;
+        if (pf) prof.begin(st, p0);
         if (main_hybrid && T > hybrid_t && use_mmq) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
@@ -2266,12 +2534,17 @@ struct Engine {
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        if (pf) prof.mark(3, st);   // the embedding ends here; the layers follow
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
                   last ? hmain : h);
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (pf) {
+            prof.mark(4, st);   // the output head ends here
+            prof.report();
+        }
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -2313,6 +2586,11 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        const bool pf = prof.on && T == 1;
+        if (pf) {
+            in_mtp = true;
+            prof.begin(st, p0);
+        }
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
@@ -2322,6 +2600,10 @@ struct Engine {
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
         layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
         if (draft) head_draft(hmtp + (size_t) (T - 1) * N);
+        if (pf) {
+            prof.mark(5, st);   // the whole draft pass, kept out of the main model's buckets
+            in_mtp = false;
+        }
     }
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
@@ -3389,8 +3671,144 @@ struct Serve {
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
+    // ---- parked conversations (--conversation-cache-mib).  Without this the engine can only keep the conversations
+    // it has VRAM slots for, and a request matching none of them wipes one, so reuse is capped at the last
+    // conversation.  A conversation's state is parkable here because the recurrent state is fixed-size: parking is a
+    // copy to host RAM and mounting is a copy back, never a rewind.  The budget, LRU, matching and shared-prefix
+    // borrowing are strata core's ConversationCache, used as it stands.
+    strata::core::ConversationCache conv_cache{0, 0, 0};
+    // The turn boundaries each slot's conversation has been through, as checkpoints: the running state at each.  They
+    // ride with the parked conversation, and they are what make a partial match useful - a client whose re-rendered
+    // history stops reproducing the engine's tokens at token N continues from the last boundary at or before N
+    // instead of reading the whole prompt again.
+    std::vector<std::vector<strata::core::ConversationCheckpoint>> sess_cps;
+    size_t conv_parks = 0, conv_mounts = 0, conv_park_ms = 0, conv_mount_ms = 0;
 
-    explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
+    /// The state a match refers to: the live one, or the checkpoint at the turn boundary the match ends on.
+    static const strata::core::ConversationCheckpoint* snapshot(const strata::core::SavedConversation& img,
+                                                                const strata::core::ConversationCache::Match& m) {
+        if (m.live) return &img.live;
+        for (const auto& c : img.checkpoints) if ((int64_t) c.ids.size() == m.tokens) return &c;
+        return nullptr;
+    }
+    /// The turn boundaries that survive a mount of `upto` tokens: the session continues from where it mounted, so the
+    /// boundaries past that point belong to a branch it did not take.
+    static std::vector<strata::core::ConversationCheckpoint> prefixes(
+        const std::vector<strata::core::ConversationCheckpoint>& cps, int64_t upto) {
+        std::vector<strata::core::ConversationCheckpoint> out;
+        for (const auto& c : cps) if ((int64_t) c.ids.size() <= upto) out.push_back(c);
+        return out;
+    }
+    size_t cps_bytes(size_t s) const {
+        size_t n = 0;
+        for (const auto& c : sess_cps[s]) n += c.gdn.size() + c.tails.size() + c.ple.size();
+        return n;
+    }
+
+    /// Report the cache in the words serve's Monitor card reads (serve/server.py, ConversationCacheLog):
+    /// `conversation cache: parked|restored|skipped N tokens ... parked=<n> bytes=<n> evictions=<n>`.  serve tails the
+    /// engine's log, so this is the whole interface: it counts parks and restores, takes the parked count, the bytes
+    /// and the evictions from the last line, and the card shows what the conversations cost in RAM against the budget.
+    /// Stderr, not stdout: the log file is the engine's stderr, while stdout is the request protocol's pipe to serve.
+    void conv_report(const char* what, int64_t tokens) {
+        std::fprintf(stderr, "strata-q36: conversation cache: %s %lld tokens, %zu of %zu slots, parked=%zu bytes=%zu "
+                             "evictions=%zu\n", what, (long long) tokens, conv_cache.size(), conv_cache.slots(),
+                             conv_cache.size(), conv_cache.bytes(), conv_cache.evictions());
+        std::fflush(stderr);
+    }
+    /// Entries the cache dropped because a longer conversation now holds their state.  serve reads this line for the
+    /// parked count alone, so it is the count that matters here, not the reason.
+    void conv_dropped(size_t n) {
+        std::fprintf(stderr, "strata-q36: conversation cache: dropped %zu superseded by a longer conversation, "
+                             "parked=%zu bytes=%zu\n", n, conv_cache.size(), conv_cache.bytes());
+        std::fflush(stderr);
+    }
+
+    /// Park the conversation session `s` holds, so a later request that starts with it reads only what is new.
+    /// Admits against the budget before touching the device, and skips a conversation carrying pictures (their state
+    /// is keyed by image identity, which this path does not park).
+    void park(int s) {
+        if (!conv_cache.enabled()) return;
+        const Engine::Sess& ss = E.sess[(size_t) s];
+        const int64_t L = (int64_t) ss.live.size();
+        if (L <= 0 || !ss.imgs.empty() || !conv_cache.wants(L)) return;
+        const size_t incoming = E.conv_image_bytes(L) + cps_bytes((size_t) s);
+        if (!conv_cache.can_fit(incoming) && !conv_cache.make_room(incoming)) { conv_report("skipped", L); return; }
+        CK(cudaStreamSynchronize(E.st));   // the state must be settled before it is read
+        const auto t0 = Clock::now();
+        strata::core::SavedConversation img;
+        E.conv_save(s, img);
+        if (img.kv.empty()) return;
+        // The state this conversation stood in at the end of the previous turn is a turn boundary, and it is already
+        // in the cache as the entry this park supersedes - so carry it as a checkpoint rather than copying it again.
+        // Those boundaries are what make a later divergence cheap: the client's re-rendered history stops reproducing
+        // the engine's tokens somewhere, and the conversation continues from the last boundary at or before that.
+        std::vector<strata::core::ConversationCheckpoint> cps = sess_cps[(size_t) s];
+        const auto prev = conv_cache.best(ss.live, {}, false);
+        if (prev.tokens > 0 && prev.tokens < L) {
+            if (const strata::core::SavedConversation* old = conv_cache.find(prev.serial))
+                if ((int64_t) old->live.ids.size() == prev.tokens) {
+                    auto c = old->live;
+                    c.ids.resize((size_t) prev.tokens);
+                    cps.push_back(std::move(c));
+                }
+        }
+        img.checkpoints = std::move(cps);   // the earlier boundaries this conversation has been through
+        const size_t dropped = conv_cache.drop_superseded(ss.live, {}, img.checkpoints, false);
+        if (dropped) conv_dropped(dropped);
+        if (!conv_cache.put(std::move(img))) { conv_report("skipped", L); return; }
+        ++conv_parks;
+        conv_park_ms += (size_t) ms_since(t0);
+        conv_report("parked", L);
+    }
+
+    /// Record the turn boundary a mount landed on, so the conversation carries it forward.  This is the state that
+    /// was just restored, so it costs no device copy - and without it a conversation that continues from its own live
+    /// state records no boundary at all, which is what made a later divergence cost the whole prompt.
+    void carry(size_t s, const strata::core::ConversationCheckpoint& snap, int64_t upto,
+               const std::vector<strata::core::ConversationCheckpoint>& from) {
+        sess_cps[s] = prefixes(from, upto);
+        for (const auto& c : sess_cps[s]) if ((int64_t) c.ids.size() == upto) return;
+        strata::core::ConversationCheckpoint b = snap;
+        b.ids.resize((size_t) upto);
+        sess_cps[s].push_back(std::move(b));
+    }
+
+    /// Mount a parked conversation into session `s`: the tokens it holds on success, 0 on a failed copy (the image
+    /// goes back, so the conversation is not lost).  A whole mount takes the entry; a prefix mount borrows it, so the
+    /// donor keeps serving the conversations that share its start.
+    int64_t mount(const strata::core::ConversationCache::Match& m, int s) {
+        const auto t0 = Clock::now();
+        if (conv_cache.borrows(m)) {
+            conv_cache.guard(m.serial);
+            const strata::core::SavedConversation* img = conv_cache.find(m.serial);
+            const strata::core::ConversationCheckpoint* snap = img ? snapshot(*img, m) : nullptr;
+            const bool ok = snap != nullptr && E.conv_restore(*img, s, m.tokens, *snap);
+            conv_cache.unguard();
+            if (!ok) return 0;
+            conv_cache.count_borrow();
+            carry((size_t) s, *snap, m.tokens, img->checkpoints);
+            ++conv_mounts;
+            conv_mount_ms += (size_t) ms_since(t0);
+            conv_report("restored", m.tokens);
+            return m.tokens;
+        }
+        strata::core::SavedConversation img = conv_cache.take(m.index);
+        const strata::core::ConversationCheckpoint* snap = snapshot(img, m);
+        if (snap == nullptr || !E.conv_restore(img, s, m.tokens, *snap)) {
+            conv_cache.put(std::move(img));
+            std::fprintf(stderr, "strata-q36: mounting a parked conversation of %lld tokens into slot %d failed; "
+                                 "reading the prompt\n", (long long) m.tokens, s);
+            return 0;
+        }
+        carry((size_t) s, *snap, m.tokens, img.checkpoints);
+        ++conv_mounts;
+        conv_mount_ms += (size_t) ms_since(t0);
+        conv_report("restored", m.tokens);
+        return m.tokens;
+    }
+
+    explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess), sess_cps((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
 
@@ -3733,11 +4151,21 @@ struct Serve {
                 reuse = best;
             }
         }
+        // A parked conversation holding more of this prompt than any live session: mount it.  This is what lifts the
+        // cap of one conversation - the state a request needs can come from host RAM, not only from a VRAM slot.
+        if (!adm && conv_cache.enabled() && ir.imgs.empty()) {
+            const auto cm = conv_cache.best(ids, {}, false);
+            if (cm.tokens > (int64_t) reuse) {
+                const int64_t got = mount(cm, s);
+                if (got > 0) reuse = (size_t) got;
+            }
+        }
         E.select(s);
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
+            sess_cps[(size_t) s].clear();   // the slot's turn boundaries belonged to the conversation that was here
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
@@ -3865,6 +4293,8 @@ struct Serve {
             if (!smp.needs_logits()) nx = E.greedy();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
+        if (!adm) park(E.cur);   // park it before the reply is reported: a later request that starts with this
+                                  // conversation mounts it from host RAM instead of reading it again
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
@@ -3925,8 +4355,25 @@ struct Serve {
     }
 };
 
-int serve(Engine& E) {
+int serve(Engine& E, size_t conv_mib, size_t conv_slots, int64_t conv_min_tokens) {
     Serve sv(E);
+    if (conv_mib > 0) {
+        sv.conv_cache = strata::core::ConversationCache(conv_mib << 20, conv_slots, conv_min_tokens);
+        size_t gd, tl, pl;
+        E.conv_state_bytes(gd, tl, pl);
+        const size_t state = gd + tl + pl, whole = E.conv_image_bytes(E.ctx);
+        const size_t per_tok = E.ctx > 0 && whole > state ? (whole - state) / (size_t) E.ctx : 0;
+        std::fprintf(stderr, "strata-q36: conversation cache: %zu MiB of host RAM, up to %zu conversations.  A "
+                             "conversation's running state is %.2f GiB (fixed: the GDN state is not per token) and "
+                             "its KV %zu B/token, so one at %d tokens is %.2f GiB and the cache holds about %zu of "
+                             "them; parking evicts the least recently used.\n",
+                     conv_mib, conv_slots, (double) state / (1 << 30), per_tok, E.ctx,
+                     (double) whole / (1 << 30), whole > 0 ? (conv_mib << 20) / whole : (size_t) 0);
+        // The Monitor's card reads these two facts from the engine's INFO line (serve/server.py): the budget it shows
+        // the parked bytes against, and how many conversations it can hold.
+        std::printf("INFO conversation_cache_mib=%zu conversation_cache_slots=%zu\n", conv_mib, conv_slots);
+        std::fflush(stdout);
+    }
     return sv.run();
 }
 
@@ -3938,6 +4385,10 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     std::string kv = "fp32";   // --kv fp32 | int8: the KV cache's width (int8: 1,056 B/cell against 4,096)
+    // --conversation-cache-mib: host RAM set aside for parked conversations (0: off).  Without it reuse is capped at
+    // the conversations that fit in VRAM slots, which on an 8 GB card at a long context is one.
+    size_t conv_mib = 0, conv_slots = 8;
+    int64_t conv_min_tokens = 0;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
@@ -3956,6 +4407,9 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--kv") kv = next();   // fp32 | int8: the KV cache's width (q4_0 / k8v4 are strata core's, not here)
+        else if (a == "--conversation-cache-mib") conv_mib = (size_t) std::atoll(next().c_str());
+        else if (a == "--conversation-cache-slots") conv_slots = (size_t) std::atoll(next().c_str());
+        else if (a == "--conversation-cache-min-tokens") conv_min_tokens = std::atoll(next().c_str());
         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
         else if (a == "--tokens") tokens = next();
         else if (a == "--n") n_gen = std::atoi(next().c_str());
@@ -4096,7 +4550,9 @@ int strata::qwen35::run(int argc, char** argv) {
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
     if (warm) E.warmup();
-    if (serve_mode) return serve(E);
+    if (serve_mode) return serve(E, conv_mib, conv_slots, conv_min_tokens);
+    if (conv_mib > 0) std::fprintf(stderr, "strata-q36: --conversation-cache-mib parks conversations between "
+                                           "requests: it needs --serve, ignored\n");
     if (bench_pp > 0 || bench_tg > 0) {
         // llama-bench's shapes: a prompt of bench_pp tokens from a fresh state, then bench_tg tokens one at a time
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
