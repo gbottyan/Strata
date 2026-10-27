@@ -364,24 +364,26 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     }
 }
 
-/// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
-/// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
-/// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-template <bool Q8>
+/// Split-K attention.  One block per (chunk of 256 cells, query row, group of GQ query heads): query row qi = t * H + h
+/// (t from t0) sees the cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the
+/// query's cells write nothing (the merge stops before them).  grid (n_rows, n_chunk), block 256, HD == 256.
+///
+/// GQ is the point of the layout.  H / HKV = 8 query heads share a KV head, so they read the same 256 cells: giving
+/// each head its own block fetched those rows 8 times over.  GQ = 2 cuts that to a quarter for 5 KiB of shared
+/// memory, which still fits 8 blocks per SM - the full occupancy the memory latency hiding needs.  GQ = 8 cuts it
+/// again, for 17 KiB and 2 blocks per SM; that trade is what decides the value here, not the traffic.
+template <bool Q8, int GQ>
 __global__ void k_attn_part(const float* q, const float* kc, const float* vc, int8_t* kc8, int8_t* vc8,
                             int8_t* kc8h, int8_t* vc8h,
                             float2* ksc, float2* vsc, const int32_t* pos0, int t0, int H,
                             int HKV, int ctx, int nres, float scale, int n_chunk, float* pacc, float* pm, float* pl,
                             RowSel rs) {
     constexpr int HD = 256;
-    __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
-    // The head is the grid's fast axis (the launch site pairs it with blockIdx.x).  This was tried as a fix for
-    // decode-at-depth: the H/HKV = 8 query heads of one KV head read the same K and V, blocks launch x-first, and the
-    // 2 MB of L2 on a Pascal card is far too small to bridge 375 blocks, so the layout looked like 8x the traffic.
-    // It measured neutral (attn 3851 ms vs 3813 ms over 25 steps at 96k), so it is not the cost.  Kept because the
-    // coalesced K read below wants blocks of one head adjacent, and it costs nothing.
-    const int row = blockIdx.x, c = blockIdx.y;
-    const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
+    __shared__ float qs[GQ][HD], sc[GQ][kChunkCells], sh[kThreads], sumq[GQ];
+    const int row_g = blockIdx.x, c = blockIdx.y;
+    const int G = H / HKV, GPG = G / GQ;   // query heads per KV head, groups of them per KV head
+    const int t = t0 + row_g / (H / GQ), hg = row_g % (H / GQ);
+    const int kvh = hg / GPG, g0 = (hg % GPG) * GQ;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
         kc = rs.kc[rs.slot[t]];
@@ -401,64 +403,104 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
     const bool res = p0 < nres;
     const int stride = res ? nres : ctx - nres, off = res ? 0 : nres;
     const int j = threadIdx.x;
-    qs[j] = q[((size_t) t * H + h) * HD + j];
+    for (int g = 0; g < GQ; ++g) qs[g][j] = q[((size_t) t * H + kvh * G + g0 + g) * HD + j];
     __syncthreads();
     // sum of the query's dims: the affine dequantisation pulls out of the K dot product,
     //   sum_i q[i] * (code[i] * s + m)  ==  s * sum_i q[i] * code[i]  +  m * sum_i q[i]
-    const float sumq = Q8 ? block_sum(qs[j], sh) : 0.f;
+    if (Q8) {
+        for (int g = 0; g < GQ; ++g) sumq[g] = block_sum(qs[g][j], sh);
+        __syncthreads();
+    }
     // K's dot products, one warp per cell.  The one-thread-per-cell layout that the softmax and the V sum below use
     // walks a cell's 256 dims in that thread, so a warp's 32 lanes read 32 rows 256 bytes apart: 32 sectors fetched for
-    // 32 bytes used, 32x the traffic.  Measured at 96k context: 154 ms of a 189 ms decode step.  A warp taking one
-    // cell reads its 256 contiguous bytes (8 dims per lane) in 8 full sectors; the block's 8 warps take 8 cells a pass.
+    // 32 bytes used, 32x the traffic.  A warp taking one cell reads its 256 contiguous bytes (8 dims per lane) in 8
+    // full sectors; the block's 8 warps take 8 cells a pass, and each cell's row serves all GQ heads of the group.
     const int warp = j >> 5, lane = j & 31;
     for (int it = 0; it < kChunkCells / 8; ++it) {
         const int cell = it * 8 + warp, pc = p0 + cell;
-        float a = 0.f;
-        if (pc < npos) {
-            if (Q8) {
-                const int8_t* kp = (res ? kc8 : kc8h) + ((size_t) kvh * stride + (pc - off)) * HD + lane * 8;
+        if (pc >= npos) break;   // warp-uniform: cell is a function of the warp, so the whole warp leaves together
+        if (Q8) {
+            const int8_t* kp = (res ? kc8 : kc8h) + ((size_t) kvh * stride + (pc - off)) * HD + lane * 8;
+            const float2 k2 = ksc[(size_t) kvh * ctx + pc];
+            float a[GQ];
 #pragma unroll
-                for (int i = 0; i < 8; ++i) a += qs[lane * 8 + i] * (float) kp[i];
-                a *= ksc[(size_t) kvh * ctx + pc].x;   // the cell's scale is uniform, so it factors out of the warp
-            } else {
-                const float* kp = kc + ((size_t) kvh * ctx + pc) * HD + lane * 8;
+            for (int g = 0; g < GQ; ++g) {
+                a[g] = 0.f;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) a += qs[lane * 8 + i] * kp[i];
+                for (int i = 0; i < 8; ++i) a[g] += qs[g][lane * 8 + i] * (float) kp[i];
+                a[g] *= k2.x;   // the cell's scale is uniform, so it factors out of the warp
+            }
+#pragma unroll
+            for (int g = 0; g < GQ; ++g) a[g] = warp_sum(a[g]);   // every lane calls it: a shuffle needs the whole warp
+            if (lane == 0) {
+#pragma unroll
+                for (int g = 0; g < GQ; ++g) {
+                    // The affine dequant's offset is a constant of the cell, so it goes in once, after the reduction.
+                    // Adding it to each lane's partial (as the one-thread-per-cell layout did) counts it 32 times: a
+                    // per-cell error of 31 * sumq * scale.y * scale, up to 0.025 on a score, which exp() turns into
+                    // 2.6% on the attention output - enough to make generation collapse into repetition.
+                    sc[g][cell] = (a[g] + sumq[g] * k2.y) * scale;
+                }
+            }
+        } else {
+            const float* kp = kc + ((size_t) kvh * ctx + pc) * HD + lane * 8;
+            float a[GQ];
+#pragma unroll
+            for (int g = 0; g < GQ; ++g) {
+                a[g] = 0.f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) a[g] += qs[g][lane * 8 + i] * kp[i];
+                a[g] = warp_sum(a[g]);
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int g = 0; g < GQ; ++g) sc[g][cell] = a[g] * scale;
             }
         }
-        const float dot = warp_sum(a);   // every lane calls it: a shuffle needs the whole warp
-        // The affine dequant's offset is a constant of the cell, so it goes in once, after the reduction.  Adding it to
-        // each lane's partial (as the one-thread-per-cell layout did) counts it 32 times: a per-cell error of
-        // 31 * sumq * scale.y * scale, up to 0.025 on a score, which exp() turns into 2.6% on the attention output -
-        // enough to make generation collapse into repetition.  tools/attn_test.cu checks this kernel against a CPU
-        // reference; that error is what it caught, and the same layout now passes at 3.8e-07 relative.
-        if (lane == 0) sc[cell] = Q8 ? (dot + sumq * ksc[(size_t) kvh * ctx + pc].y) * scale : dot * scale;
     }
     __syncthreads();
+    // the causal softmax, per head over the chunk's cells
     const int p = p0 + j;
-    const float s = p < npos ? sc[j] : -INFINITY;
-    const float m = block_max(s, sh);
-    const float e = p < npos ? expf(s - m) : 0.f;
-    sc[j] = e;
-    const float l = block_sum(e, sh);
+    float m[GQ], l[GQ];
+    for (int g = 0; g < GQ; ++g) {
+        const float s = p < npos ? sc[g][j] : -INFINITY;
+        m[g] = block_max(s, sh);
+        const float e = p < npos ? expf(s - m[g]) : 0.f;
+        sc[g][j] = e;
+        l[g] = block_sum(e, sh);
+    }
+    __syncthreads();
+    // V's weighted sum: thread j owns dim j of the output and walks the chunk's cells; one dequantisation serves all
+    // GQ heads, which is the other half of what sharing a block buys
     const int n = min(kChunkCells, npos - p0);
-    float acc = 0.f;
+    float acc[GQ];
+#pragma unroll
+    for (int g = 0; g < GQ; ++g) acc[g] = 0.f;
     if (Q8) {
         const int8_t* vp = (res ? vc8 : vc8h) + ((size_t) kvh * stride + (p0 - off)) * HD + j;
         const float2* vsr = vsc + (size_t) kvh * ctx + p0;
         for (int k = 0; k < n; ++k) {
             const float2 p2 = vsr[k];
-            acc += sc[k] * ((float) vp[(size_t) k * HD] * p2.x + p2.y);
+            const float v = (float) vp[(size_t) k * HD] * p2.x + p2.y;
+#pragma unroll
+            for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
         }
     } else {
         const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-        for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
+        for (int k = 0; k < n; ++k) {
+            const float v = vp[(size_t) k * HD];
+#pragma unroll
+            for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
+        }
     }
-    const size_t o = (size_t) row * n_chunk + c;
-    pacc[o * HD + j] = acc;
-    if (j == 0) {
-        pm[o] = m;
-        pl[o] = l;
+#pragma unroll
+    for (int g = 0; g < GQ; ++g) {
+        const size_t o = ((size_t) t * H + kvh * G + g0 + g) * n_chunk + c;
+        pacc[o * HD + j] = acc[g];
+        if (j == 0) {
+            pm[o] = m[g];
+            pl[o] = l[g];
+        }
     }
 }
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
@@ -2373,11 +2415,14 @@ struct Engine {
             if (n % kReport != 0) return;
             double tot = 0;
             for (double v : ms) tot += v;
-            std::fprintf(stderr, "strata-q36: profile: %ld decode steps at %lld cells: attn %.1f ms, GDN %.1f ms, "
-                                 "experts %.1f ms, embed %.1f ms, head %.1f ms, MTP draft %.1f ms = %.1f ms/token "
-                                 "(%.2f tok/s)\n",
-                         n, (long long) depth, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], tot,
-                         tot > 0 ? 1000.0 / tot : 0.0);
+            // the buckets accumulate over the whole report window, so divide them out: the line reads per token, and
+            // the tok/s it prints is the one the bench agrees with (it used to print the window's sum as ms/token,
+            // which read 25x high next to a bench line that said something else)
+            const double inv = 1.0 / (double) n;
+            std::fprintf(stderr, "strata-q36: profile: %ld decode steps at %lld cells: attn %.2f, GDN %.2f, experts "
+                                 "%.2f, embed %.2f, head %.2f, MTP draft %.2f ms/token = %.2f ms/token (%.2f tok/s)\n",
+                         n, (long long) depth, ms[0] * inv, ms[1] * inv, ms[2] * inv, ms[3] * inv, ms[4] * inv,
+                         ms[5] * inv, tot * inv, tot > 0 ? 1000.0 * inv / tot : 0.0);
             std::fflush(stderr);
             for (double& v : ms) v = 0;
             n = 0;
@@ -2522,8 +2567,8 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    (kv_q8 ? k_attn_part<true> : k_attn_part<false>)
-                        <<<dim3(nt * H, nc), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                    (kv_q8 ? k_attn_part<true, 2> : k_attn_part<false, 2>)
+                        <<<dim3(nt * (H / 2), nc), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                   rows_mode ? nullptr : vc[li],
                                                                   rows_mode ? nullptr : kc8[li],
                                                                   rows_mode ? nullptr : vc8[li],
