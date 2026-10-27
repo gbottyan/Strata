@@ -58,9 +58,14 @@ class ChatTemplate:
                **kwargs) -> str:
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
         # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
+        # A turn whose text is all reasoning is not empty: a thinking model that answers with content null and
+        # reasoning_content full had every one of its turns dropped here, so an agent loop that appends only and
+        # sends the reasoning back lost the whole assistant history, the prompt stopped being a start of what the
+        # engine holds, and the prompt cache matched nothing on every turn.
         messages = [m for i, m in enumerate(messages)
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
+                                                      and not str(m.get("reasoning_content") or "").strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
@@ -104,13 +109,22 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
+        # The template prints an assistant turn's thinking only when preserve_thinking is true (a Qwen-family
+        # template's own condition), and a harness asks this probe before it decides whether to send reasoning back.
+        # Probing without it reported false for a template that renders reasoning perfectly well, so the client
+        # stopped echoing and the prompt cache matched nothing.  Ask the template what it does when asked to keep it.
+        def render_keep(messages, tools=None):
+            try:
+                return self.render(messages, tools=tools, preserve_thinking=True)
+            except Exception:                       # noqa: BLE001 - a hint only, as in render() above
+                return ""
         return {"supports_tools": all(s in tool_prompt for s in
                                       ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),
                 "supports_parallel_tool_calls": calls_supported(2),
-                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
+                "supports_preserve_reasoning": "strata_caps_reasoning" in render_keep(history)}
 
 
 # ------------------------------------------------------------------------------------------------ requests
@@ -583,6 +597,13 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+        # #the prompt cache: a Qwen-family template prints an assistant turn's thinking only when
+        # preserve_thinking is true (or the turn follows the last user message, which a harness's history never
+        # does).  Dropping it here made every assistant turn render content-only, so the reasoning tokens the
+        # engine holds were not in the next prompt and the prompt cache matched nothing: an append-only agent
+        # loop reuses nothing.  It is the client's request, so it is passed through like the two above.
+        elif k == "preserve_thinking":
+            kwargs["preserve_thinking"] = bool(v)
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 

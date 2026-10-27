@@ -1597,8 +1597,10 @@ struct Engine {
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
-                               (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+            const size_t kv_b = kv_q8 ? 1 : 4;   // the slot's K / V at the context: int8 when --kv int8, fp32 otherwise
+            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * kv_b) * (size_t) ctx * n_attn +
+                               (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn +
+                               (kv_q8 ? (size_t) 2 * 2 * (size_t) g.n_head_kv * ctx * sizeof(float2) : 0);
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
             if (n_sess > 1)
