@@ -284,6 +284,10 @@ struct RowSel {
     int8_t* const* vc8 = nullptr;
     float2* const* ksc = nullptr;
     float2* const* vsc = nullptr;
+    // --kv-resident: the spilled half of each session's cache, in pinned host memory.  Same [kvh][cells][HD] shape as
+    // kc8 / vc8 but with (ctx - nres) cells, so a kernel picks the base by which side of nres a cell falls on.
+    int8_t* const* kc8h = nullptr;
+    int8_t* const* vc8h = nullptr;
 };
 
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
@@ -295,9 +299,12 @@ struct RowSel {
 template <bool Q8>
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* gate, float* kc, float* vc, int8_t* kc8, int8_t* vc8,
+                            int8_t* kc8h, int8_t* vc8h,
                             float2* ksc, float2* vsc, int H, int HKV, int HD, int n_rot,
-                            const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
+                            const int32_t* pos0, int ctx, int nres, float base, float eps, const int32_t* rdelta,
                             const int32_t* mtab, RowSel rs) {
+    // --kv-resident: the cache is cut at cell nres, so a row lands in VRAM (stride nres) or in pinned host memory
+    // (stride ctx - nres).  The scales stay wholly in VRAM at stride ctx, where the attention kernel reads them.
     __shared__ float sh[kThreads];
     __shared__ float buf[256];
     const int head = blockIdx.x, t = blockIdx.y;
@@ -311,6 +318,7 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
             vc8 = rs.vc8[rs.slot[t]];
             ksc = rs.ksc[rs.slot[t]];
             vsc = rs.vsc[rs.slot[t]];
+            if (rs.kc8h) { kc8h = rs.kc8h[rs.slot[t]]; vc8h = rs.vc8h[rs.slot[t]]; }
         }
     }
     const bool isq = head < H;
@@ -344,9 +352,11 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
             // V with their own (scale, min)
             const float2 kp = kv_params(block_min(v, sh), block_max(v, sh));
             const float2 vp = kv_params(block_min(vv, sh), block_max(vv, sh));
-            kc8[row * HD + i] = kv_q(v, kp.x, kp.y);
-            vc8[row * HD + i] = kv_q(vv, vp.x, vp.y);
-            if (i == 0) { ksc[row] = kp; vsc[row] = vp; }
+            const bool res = pos < nres;   // which side of the --kv-resident cut this cell falls on
+            const size_t r = res ? (size_t) kh * nres + pos : (size_t) kh * (ctx - nres) + (pos - nres);
+            (res ? kc8 : kc8h)[r * HD + i] = kv_q(v, kp.x, kp.y);
+            (res ? vc8 : vc8h)[r * HD + i] = kv_q(vv, vp.x, vp.y);
+            if (i == 0) { ksc[row] = kp; vsc[row] = vp; }   // the scales stay in one table at stride ctx
         } else {
             kc[row * HD + i] = v;
             vc[row * HD + i] = vv;
@@ -359,8 +369,10 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
 template <bool Q8>
 __global__ void k_attn_part(const float* q, const float* kc, const float* vc, int8_t* kc8, int8_t* vc8,
+                            int8_t* kc8h, int8_t* vc8h,
                             float2* ksc, float2* vsc, const int32_t* pos0, int t0, int H,
-                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
+                            int HKV, int ctx, int nres, float scale, int n_chunk, float* pacc, float* pm, float* pl,
+                            RowSel rs) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
     // The head is the grid's fast axis (the launch site pairs it with blockIdx.x).  This was tried as a fix for
@@ -379,10 +391,15 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
             vc8 = rs.vc8[rs.slot[t]];
             ksc = rs.ksc[rs.slot[t]];
             vsc = rs.vsc[rs.slot[t]];
+            if (rs.kc8h) { kc8h = rs.kc8h[rs.slot[t]]; vc8h = rs.vc8h[rs.slot[t]]; }
         }
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
+    // --kv-resident: nres is a multiple of kChunkCells, so this chunk lies wholly on one side of the cut and one base
+    // and one stride serve it.  The scales stay in one table at stride ctx, in VRAM, read in the same loops.
+    const bool res = p0 < nres;
+    const int stride = res ? nres : ctx - nres, off = res ? 0 : nres;
     const int j = threadIdx.x;
     qs[j] = q[((size_t) t * H + h) * HD + j];
     __syncthreads();
@@ -399,7 +416,7 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
         float a = 0.f;
         if (pc < npos) {
             if (Q8) {
-                const int8_t* kp = kc8 + ((size_t) kvh * ctx + pc) * HD + lane * 8;
+                const int8_t* kp = (res ? kc8 : kc8h) + ((size_t) kvh * stride + (pc - off)) * HD + lane * 8;
 #pragma unroll
                 for (int i = 0; i < 8; ++i) a += qs[lane * 8 + i] * (float) kp[i];
                 a *= ksc[(size_t) kvh * ctx + pc].x;   // the cell's scale is uniform, so it factors out of the warp
@@ -427,7 +444,7 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
     if (Q8) {
-        const int8_t* vp = vc8 + ((size_t) kvh * ctx + p0) * HD + j;
+        const int8_t* vp = (res ? vc8 : vc8h) + ((size_t) kvh * stride + (p0 - off)) * HD + j;
         const float2* vsr = vsc + (size_t) kvh * ctx + p0;
         for (int k = 0; k < n; ++k) {
             const float2 p2 = vsr[k];
@@ -531,20 +548,27 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
     for (int i = threadIdx.x; i < n; i += blockDim.x) parts[(size_t) e * n + i] = cpu[(size_t) e * n + i];
 }
 /// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
-/// [kvh][P][HD] halves.  grid1(HKV * P * HD).
+/// [kvh][P][HD] halves.  grid1(HKV * P * HD).  With --kv-resident the cells straddle the cut, which one launch still
+/// covers: a warp spans 32 of the 256 dims of a single cell, so the side it picks is warp-uniform.
 template <bool Q8>
-__global__ void k_kv_f16(const float* kc, const float* vc, int8_t* kc8, int8_t* vc8, float2* ksc, float2* vsc,
-                         __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
+__global__ void k_kv_f16(const float* kc, const float* vc, int8_t* kc8, int8_t* vc8, int8_t* kc8h, int8_t* vc8h,
+                         float2* ksc, float2* vsc, __half* k16, __half* v16, int ctx, int nres, int P, int HD, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) HKV * P * HD) return;
     const int64_t per = (int64_t) P * HD;
     const int64_t kvh = i / per, rest = i % per;
-    const size_t src = (size_t) kvh * ctx * HD + rest;
     if (Q8) {
-        const size_t row = (size_t) kvh * ctx + rest / HD;   // rest = cell * HD + dim
-        k16[i] = __float2half(kv_deq(kc8[src], ksc[row].x, ksc[row].y));
-        v16[i] = __float2half(kv_deq(vc8[src], vsc[row].x, vsc[row].y));
+        const int64_t cell = rest / HD;   // rest = cell * HD + dim
+        const bool res = cell < nres;
+        const size_t src = (res ? (size_t) kvh * nres + cell : (size_t) kvh * (ctx - nres) + (cell - nres)) * HD +
+                           (size_t) (rest % HD);
+        const size_t row = (size_t) kvh * ctx + cell;   // the scales: one table, wholly in VRAM
+        const int8_t* k = res ? kc8 : kc8h;
+        const int8_t* v = res ? vc8 : vc8h;
+        k16[i] = __float2half(kv_deq(k[src], ksc[row].x, ksc[row].y));
+        v16[i] = __float2half(kv_deq(v[src], vsc[row].x, vsc[row].y));
     } else {
+        const size_t src = (size_t) kvh * ctx * HD + rest;
         k16[i] = __float2half(kc[src]);
         v16[i] = __float2half(vc[src]);
     }
@@ -1249,6 +1273,15 @@ template <class T> T* dalloc_t(size_t n) {
     CK(cudaMemset(p, 0, n * sizeof(T)));
     return p;
 }
+/// Pinned host memory the GPU can dereference (UVA): --kv-resident keeps the spilled KV cells here, so the attention
+/// kernel reads them over PCIe in place of a copy.  Mapped is what makes that legal; the host-side zeroing is cheap
+/// next to the cudaMemset a device allocation would need, and the buffer is written before it is ever read.
+template <class T> T* pinned_t(size_t n) {
+    T* p = nullptr;
+    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocDefault | cudaHostAllocMapped));
+    std::memset(p, 0, n * sizeof(T));
+    return p;
+}
 
 /// A picture in a prompt: its first cell, its rows, and the hash the conversation cache compares it by.
 struct ImgKey {
@@ -1276,8 +1309,14 @@ struct Engine {
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
     std::vector<int8_t*> kc8, vc8;         // the int8 KV cache (--kv int8): codes, same [kvh][ctx][HD] layout ...
+    std::vector<int8_t*> kc8h, vc8h;       // ... and, with --kv-resident, the cells past nres in pinned host memory
     std::vector<float2*> ksc, vsc;         // ... and one (scale, min) per [kvh][ctx] row.  kc / vc stay null then.
     bool kv_q8 = false;                    // the cache is the int8 one (set from --kv before the buffers are allocated)
+    // --kv-resident N: cells [0, nres) of every layer's K / V live in VRAM, cells [nres, ctx) in pinned host memory
+    // that the kernels dereference directly (zero-copy over PCIe).  ctx, the default, keeps the whole cache in VRAM,
+    // as before.  The boundary is a multiple of kChunkCells, so a decode chunk lies wholly on one side of the cut and
+    // no warp straddles it.
+    int nres = 0;
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1315,6 +1354,7 @@ struct Engine {
     struct Sess {
         std::vector<float*> conv, S, kc, vc;
         std::vector<int8_t*> kc8, vc8;
+        std::vector<int8_t*> kc8h, vc8h;   // --kv-resident: the cells past nres, in pinned host memory (null: all resident)
         std::vector<float2*> ksc, vsc;
         float* hlast = nullptr;
         int64_t pos = 0;
@@ -1330,6 +1370,7 @@ struct Engine {
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
     float **d_conv_tab = nullptr, **d_S_tab = nullptr, **d_kc_tab = nullptr, **d_vc_tab = nullptr;
     int8_t **d_kc8_tab = nullptr, **d_vc8_tab = nullptr;   // the int8 cache's tables (--kv int8)
+    int8_t **d_kc8h_tab = nullptr, **d_vc8h_tab = nullptr; // ... and the spilled side's (--kv-resident)
     float2 **d_ksc_tab = nullptr, **d_vsc_tab = nullptr;
     int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
     // the GDN layers run a slot's rows in sequence: per group (a slot) its session, its first row and its row count
@@ -1418,10 +1459,18 @@ struct Engine {
         if (kv_q8) {
             ss.kc.push_back(nullptr);
             ss.vc.push_back(nullptr);
-            ss.kc8.push_back(dalloc_t<int8_t>(cells * g.head_dim));
-            ss.vc8.push_back(dalloc_t<int8_t>(cells * g.head_dim));
+            // With --kv-resident the cache is cut at cell nres: the resident part in VRAM, the rest in pinned host
+            // memory the kernels read directly.  Each part is [kvh][its own cell count][head_dim], so a kernel picks
+            // the base by which side a cell is on and indexes with that side's stride.  The scales stay wholly in VRAM:
+            // they are 1/32 of the cache's bytes, and the decode kernel reads them in the same loop as the codes, so
+            // spilling them would put a second PCIe stream on the critical path for almost no VRAM back.
+            const int nsp = ctx - nres;   // spilled cells per kv head (0 when everything is resident)
+            ss.kc8.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * nres * g.head_dim));
+            ss.vc8.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * nres * g.head_dim));
             ss.ksc.push_back(dalloc_t<float2>(cells));
             ss.vsc.push_back(dalloc_t<float2>(cells));
+            ss.kc8h.push_back(nsp > 0 ? pinned_t<int8_t>((size_t) g.n_head_kv * nsp * g.head_dim) : nullptr);
+            ss.vc8h.push_back(nsp > 0 ? pinned_t<int8_t>((size_t) g.n_head_kv * nsp * g.head_dim) : nullptr);
         } else {
             ss.kc.push_back(dalloc(cells * g.head_dim));
             ss.vc.push_back(dalloc(cells * g.head_dim));
@@ -1429,6 +1478,8 @@ struct Engine {
             ss.vc8.push_back(nullptr);
             ss.ksc.push_back(nullptr);
             ss.vsc.push_back(nullptr);
+            ss.kc8h.push_back(nullptr);
+            ss.vc8h.push_back(nullptr);
         }
     }
     void alloc_session(Sess& ss) const {
@@ -1448,6 +1499,8 @@ struct Engine {
                 ss.vc8.push_back(nullptr);
                 ss.ksc.push_back(nullptr);
                 ss.vsc.push_back(nullptr);
+                ss.kc8h.push_back(nullptr);   // every cache vector is indexed by layer, so all of them get a slot
+                ss.vc8h.push_back(nullptr);
             }
         }
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
@@ -1469,6 +1522,7 @@ struct Engine {
         Sess& ss = sess[(size_t) cur];
         conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
         kc8 = ss.kc8; vc8 = ss.vc8; ksc = ss.ksc; vsc = ss.vsc;
+        kc8h = ss.kc8h; vc8h = ss.vc8h;   // --kv-resident: empty when the whole cache is resident
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -1647,7 +1701,7 @@ struct Engine {
             const size_t ns = sess[0].conv.size();
             const size_t nt = ns * (size_t) n_sess;
             std::vector<float*> hc(nt), hs(nt), hk(nt), hv(nt);
-            std::vector<int8_t*> hk8(nt), hv8(nt);
+            std::vector<int8_t*> hk8(nt), hv8(nt), hk8h(nt), hv8h(nt);
             std::vector<float2*> hks(nt), hvs(nt);
             for (size_t li = 0; li < ns; ++li)
                 for (int s_ = 0; s_ < n_sess; ++s_) {
@@ -1657,6 +1711,8 @@ struct Engine {
                     hv[li * n_sess + s_] = sess[(size_t) s_].vc[li];
                     hk8[li * n_sess + s_] = sess[(size_t) s_].kc8[li];
                     hv8[li * n_sess + s_] = sess[(size_t) s_].vc8[li];
+                    hk8h[li * n_sess + s_] = sess[(size_t) s_].kc8h[li];   // null when --kv-resident is off
+                    hv8h[li * n_sess + s_] = sess[(size_t) s_].vc8h[li];
                     hks[li * n_sess + s_] = sess[(size_t) s_].ksc[li];
                     hvs[li * n_sess + s_] = sess[(size_t) s_].vsc[li];
                 }
@@ -1673,6 +1729,8 @@ struct Engine {
             mk_tab((void**) &d_vc8_tab, hv8.data());
             mk_tab((void**) &d_ksc_tab, hks.data());
             mk_tab((void**) &d_vsc_tab, hvs.data());
+            mk_tab((void**) &d_kc8h_tab, hk8h.data());   // --kv-resident: all null when the cache is wholly resident
+            mk_tab((void**) &d_vc8h_tab, hv8h.data());
             d_rcell = dalloc_t<int32_t>(kVerify);
             d_rslot = dalloc_t<int32_t>(kVerify);
             d_rdelta = dalloc_t<int32_t>(kVerify);
@@ -1752,20 +1810,35 @@ struct Engine {
     /// [kvh][upto][head_dim].  Within one kvh the two layouts line up element for element, so every contiguous run
     /// of the parked buffer is one straight copy at a fixed device offset - no staging buffer, no transpose.
     /// False on a transfer error; the caller then leaves the session alone.
-    static bool conv_copy(strata::core::ConversationBuffer& buf, size_t row_bytes, size_t pitch,
-                          void* dev, cudaMemcpyKind dir) {
-        if (!dev || row_bytes == 0 || buf.size() % row_bytes != 0) return false;
-        for (size_t at = 0; at < buf.size(); at += row_bytes) {
-            const size_t h = at / row_bytes, n = std::min(row_bytes, buf.size() - at);
-            const bool ok = buf.visit(at, n, [&](uint8_t* p, size_t cnt, size_t off) {
-                const size_t inner = off - at;
-                char* d = (char*) dev + h * pitch + inner;
-                if (dir == cudaMemcpyDeviceToHost) return cudaMemcpy(p, d, cnt, dir) == cudaSuccess;
-                return cudaMemcpy(d, p, cnt, dir) == cudaSuccess;
+    /// A cache's rows into / out of a parked conversation: HK blocks of row_bytes.  The parked form is one packed
+    /// [kvh][cells][head_dim] block, so its row pitch is cells * esz, while the live cache's is ctx * esz - and under
+    /// --kv-resident the live cells are cut at nres, which is where the two pitches part company.  A save is then two
+    /// calls per array: the resident cells at dst_off 0, the spilled ones at dst_off past them, each with its own
+    /// source pitch.  dst_pitch is the parked pitch, src_pitch the live one.
+    static bool conv_copy(strata::core::ConversationBuffer& buf, size_t row_bytes, size_t dst_pitch, size_t src_pitch,
+                          void* dev, cudaMemcpyKind dir, size_t dst_off = 0, size_t rows = 0) {
+        const size_t span = buf.size() - dst_off;
+        if (!dev || row_bytes == 0 || dst_pitch < row_bytes || span % row_bytes != 0) return false;
+        const size_t nh = rows ? rows : span / row_bytes;   // the parked buffer can outlast the rows being copied
+        if (nh * row_bytes > span) return false;
+        for (size_t h = 0; h < nh; ++h) {
+            const size_t at = h * row_bytes;
+            const bool ok = buf.visit(dst_off + at, row_bytes, [&](uint8_t* p, size_t cnt, size_t off) {
+                const size_t inner = off - (dst_off + at);
+                char* d = (char*) dev + h * src_pitch + inner;
+                // p sits at dst_off + h * row_bytes; the parked row is wider, so this block's row starts that much further
+                uint8_t* t = p + h * (dst_pitch - row_bytes);
+                if (dir == cudaMemcpyDeviceToHost) return cudaMemcpy(t, d, cnt, dir) == cudaSuccess;
+                return cudaMemcpy(d, t, cnt, dir) == cudaSuccess;
             });
             if (!ok) return false;
         }
         return true;
+    }
+    /// The parked form packed at exactly row_bytes (no --kv-resident cut): the destination pitch is the row's own width.
+    static bool conv_copy(strata::core::ConversationBuffer& buf, size_t row_bytes, size_t src_pitch, void* dev,
+                          cudaMemcpyKind dir, size_t rows = 0) {
+        return conv_copy(buf, row_bytes, row_bytes, src_pitch, dev, dir, 0, rows);
     }
 
     /// The running state of session `s` as bytes: the GDN state and conv history of every GDN layer, and the last
@@ -1811,10 +1884,19 @@ struct Engine {
             strata::core::ConversationKv kv;
             kv.format = kv_q8 ? 1 : 0;
             kv.cells = L; kv.heads = (int64_t) HK; kv.head_dim = (int64_t) HD;
-            const size_t row = (size_t) L * HD * esz, prow = (size_t) ctx * HD * esz;
+            const size_t row = (size_t) L * HD * esz;
             kv.k.resize(row * HK); kv.v.resize(row * HK);
-            if (!conv_copy(kv.k, row, prow, q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], cudaMemcpyDeviceToHost) ||
-                !conv_copy(kv.v, row, prow, q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], cudaMemcpyDeviceToHost)) {
+            // --kv-resident: the live cache is cut at cell nres while the parked form is packed, so each array is two
+            // copies - the resident cells first, then the spilled ones landing in the buffer just after them.
+            const size_t nr = q8 ? (size_t) std::min<int64_t>(L, nres) : L;
+            const size_t ns = q8 ? (size_t) std::max<int64_t>(0, L - (int64_t) nres) : 0;
+            const size_t pr = (q8 ? (size_t) nres : (size_t) ctx) * HD * esz, ps = (size_t) (ctx - nres) * HD * esz;
+            auto park = [&](strata::core::ConversationBuffer& dst, void* dev, void* devh) {
+                if (!conv_copy(dst, nr * HD * esz, row, pr, dev, cudaMemcpyDeviceToHost, 0, HK)) return false;
+                return !ns || conv_copy(dst, ns * HD * esz, row, ps, devh, cudaMemcpyDeviceToHost, nr * HD * esz, HK);
+            };
+            if (!park(kv.k, q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], (void*) ss.kc8h[l]) ||
+                !park(kv.v, q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], (void*) ss.vc8h[l])) {
                 img.kv.clear();
                 return;
             }
@@ -1857,7 +1939,7 @@ struct Engine {
             || snap.gdn.size() != gd || snap.tails.size() != tl || snap.ple.size() != pl
             || img.kv.size() != n_kv) return false;
         CK(cudaStreamSynchronize(st));
-        const size_t row = (size_t) upto * HD * esz, prow = (size_t) ctx * HD * esz;
+        const size_t row = (size_t) upto * HD * esz;
         size_t li = 0;
         for (size_t l = 0; l < ss.kc8.size(); ++l) {
             const bool q8 = ss.kc8[l] != nullptr, f32 = ss.kc[l] != nullptr;
@@ -1865,10 +1947,18 @@ struct Engine {
             const strata::core::ConversationKv& kv = img.kv[li++];
             if (kv.format != (kv_q8 ? 1 : 0) || kv.heads != (int64_t) HK || kv.head_dim != (int64_t) HD
                 || kv.cells < upto) return false;
-            const bool ok = conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.k), row, prow,
-                                      q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], cudaMemcpyHostToDevice) &&
-                            conv_copy(const_cast<strata::core::ConversationBuffer&>(kv.v), row, prow,
-                                      q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], cudaMemcpyHostToDevice);
+            // --kv-resident: the mirror of conv_save's two-copy park (see there).
+            const size_t nr = q8 ? (size_t) std::min<int64_t>(upto, nres) : (size_t) upto;
+            const size_t ns = q8 ? (size_t) std::max<int64_t>(0, upto - (int64_t) nres) : 0;
+            const size_t pr = (q8 ? (size_t) nres : (size_t) ctx) * HD * esz, ps = (size_t) (ctx - nres) * HD * esz;
+            auto& kbuf = const_cast<strata::core::ConversationBuffer&>(kv.k);
+            auto& vbuf = const_cast<strata::core::ConversationBuffer&>(kv.v);
+            auto load = [&](strata::core::ConversationBuffer& src, void* dev, void* devh) {
+                if (!conv_copy(src, nr * HD * esz, row, pr, dev, cudaMemcpyHostToDevice, 0, HK)) return false;
+                return !ns || conv_copy(src, ns * HD * esz, row, ps, devh, cudaMemcpyHostToDevice, nr * HD * esz, HK);
+            };
+            const bool ok = load(kbuf, q8 ? (void*) ss.kc8[l] : (void*) ss.kc[l], (void*) ss.kc8h[l]) &&
+                            load(vbuf, q8 ? (void*) ss.vc8[l] : (void*) ss.vc[l], (void*) ss.vc8h[l]);
             if (!ok) return false;
             if (q8) {
                 const size_t srow = (size_t) upto * sizeof(float2), sprow = (size_t) ctx * sizeof(float2);
@@ -2363,6 +2453,8 @@ struct Engine {
                 rs.vc = d_vc_tab + li * n_sess;
                 rs.kc8 = d_kc8_tab + li * n_sess;
                 rs.vc8 = d_vc8_tab + li * n_sess;
+                rs.kc8h = d_kc8h_tab + li * n_sess;
+                rs.vc8h = d_vc8h_tab + li * n_sess;
                 rs.ksc = d_ksc_tab + li * n_sess;
                 rs.vsc = d_vsc_tab + li * n_sess;
             }
@@ -2372,9 +2464,11 @@ struct Engine {
                                                         rows_mode ? nullptr : vc[li],
                                                         rows_mode ? nullptr : kc8[li],
                                                         rows_mode ? nullptr : vc8[li],
+                                                        rows_mode ? nullptr : (kv_q8 ? kc8h[li] : nullptr),
+                                                        rows_mode ? nullptr : (kv_q8 ? vc8h[li] : nullptr),
                                                         rows_mode ? nullptr : ksc[li],
                                                         rows_mode ? nullptr : vsc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                                                        m->rope_base, m->eps, d_delta, mtab_now, rs);
+                                                        nres, m->rope_base, m->eps, d_delta, mtab_now, rs);
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2385,8 +2479,10 @@ struct Engine {
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
                 (kv_q8 ? k_kv_f16<true> : k_kv_f16<false>)
-                    <<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], kc8[li], vc8[li], ksc[li],
-                                                                         vsc[li], k16, v16, ctx, P, HD, HKV);
+                    <<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], kc8[li], vc8[li],
+                                                                         kv_q8 ? kc8h[li] : nullptr,
+                                                                         kv_q8 ? vc8h[li] : nullptr,
+                                                                         ksc[li], vsc[li], k16, v16, ctx, nres, P, HD, HKV);
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
@@ -2431,9 +2527,11 @@ struct Engine {
                                                                   rows_mode ? nullptr : vc[li],
                                                                   rows_mode ? nullptr : kc8[li],
                                                                   rows_mode ? nullptr : vc8[li],
+                                                                  rows_mode ? nullptr : (kv_q8 ? kc8h[li] : nullptr),
+                                                                  rows_mode ? nullptr : (kv_q8 ? vc8h[li] : nullptr),
                                                                   rows_mode ? nullptr : ksc[li],
                                                                   rows_mode ? nullptr : vsc[li], dpos, t0, H, HKV, ctx,
-                                                                  1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                                                                  nres, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
                 }
             }
@@ -3115,8 +3213,7 @@ struct Engine {
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
         const size_t row = (size_t) ctx * g.head_dim * 4;
-        const size_t row8 = (size_t) ctx * g.head_dim;          // the int8 cache: one byte per dim
-        const size_t rowsc = (size_t) ctx * sizeof(float2);     // ... and its (scale, min) rows
+        const size_t rowsc = (size_t) ctx * sizeof(float2);     // the int8 cache's (scale, min) rows
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
@@ -3130,10 +3227,22 @@ struct Engine {
                     CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
                                          cudaMemcpyDeviceToDevice, st));
                 } else {   // the int8 cache: codes and scales travel together
-                    CK(cudaMemcpy2DAsync(b.kc8[l], row8, a.kc8[l], row8, (size_t) a.pos * g.head_dim,
+                    // --kv-resident: the codes are cut at cell nres, so the copy is two 2D copies on two pitches (the
+                    // resident part in VRAM, the rest in pinned host memory).  The scales stay in one table at ctx.
+                    const int nsp = ctx - nres;
+                    const size_t row8r = (size_t) nres * g.head_dim, row8s = (size_t) nsp * g.head_dim;
+                    const size_t nr = (size_t) std::min<int64_t>(a.pos, nres);
+                    const size_t ns = (size_t) std::min<int64_t>(a.pos - (int64_t) nr, nsp);
+                    CK(cudaMemcpy2DAsync(b.kc8[l], row8r, a.kc8[l], row8r, nr * g.head_dim,
                                          (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
-                    CK(cudaMemcpy2DAsync(b.vc8[l], row8, a.vc8[l], row8, (size_t) a.pos * g.head_dim,
+                    CK(cudaMemcpy2DAsync(b.vc8[l], row8r, a.vc8[l], row8r, nr * g.head_dim,
                                          (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                    if (ns > 0) {
+                        CK(cudaMemcpy2DAsync(b.kc8h[l], row8s, a.kc8h[l], row8s, ns * g.head_dim,
+                                             (size_t) g.n_head_kv, cudaMemcpyDefault, st));
+                        CK(cudaMemcpy2DAsync(b.vc8h[l], row8s, a.vc8h[l], row8s, ns * g.head_dim,
+                                             (size_t) g.n_head_kv, cudaMemcpyDefault, st));
+                    }
                     CK(cudaMemcpy2DAsync(b.ksc[l], rowsc, a.ksc[l], rowsc, (size_t) a.pos * sizeof(float2),
                                          (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
                     CK(cudaMemcpy2DAsync(b.vsc[l], rowsc, a.vsc[l], rowsc, (size_t) a.pos * sizeof(float2),
@@ -4385,6 +4494,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     std::string kv = "fp32";   // --kv fp32 | int8: the KV cache's width (int8: 1,056 B/cell against 4,096)
+    int kv_res = 0;            // --kv-resident N: N KV cells in VRAM, the rest in pinned host RAM (0: all resident)
     // --conversation-cache-mib: host RAM set aside for parked conversations (0: off).  Without it reuse is capped at
     // the conversations that fit in VRAM slots, which on an 8 GB card at a long context is one.
     size_t conv_mib = 0, conv_slots = 8;
@@ -4407,6 +4517,11 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--kv") kv = next();   // fp32 | int8: the KV cache's width (q4_0 / k8v4 are strata core's, not here)
+        // --kv-resident N: the first N KV cells stay in VRAM, the rest live in pinned host memory that the kernels
+        // read directly over PCIe.  That is a trade, not a free win: it gives back (ctx-N)/ctx of the cache's VRAM,
+        // which at 128k context buys the MMQ expert staging the prefill path needs (measured: 0.29 GiB free buys none,
+        // prefill 76 tok/s), and it costs decode, whose every token reads the whole cache.  Opt-in for that reason.
+        else if (a == "--kv-resident") kv_res = std::atoi(next().c_str());
         else if (a == "--conversation-cache-mib") conv_mib = (size_t) std::atoll(next().c_str());
         else if (a == "--conversation-cache-slots") conv_slots = (size_t) std::atoll(next().c_str());
         else if (a == "--conversation-cache-min-tokens") conv_min_tokens = std::atoll(next().c_str());
@@ -4524,6 +4639,49 @@ int strata::qwen35::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.kv_q8 = kv == "int8";   // before init: it is the cache's shape that gets allocated
+    E.nres = ctx;             // the whole cache in VRAM, which is what --kv int8 has always meant
+    // --kv-resident N: cells [0, N) of the int8 cache stay in VRAM, the rest live in pinned host RAM that the attention
+    // kernels reach over PCIe.  What it buys is the VRAM the spill frees, which on this card is what buys the prefill
+    // its MMQ staging buffers; what it costs is that a row at a position past N reads its cells over PCIe.  N is
+    // rounded down to the attention's 256-cell chunk, so a decode chunk lies wholly on one side of the cut and no warp
+    // straddles it.  The (scale, min) tables stay in VRAM: 1/32 of the cache's bytes, and spilling them would add a
+    // second PCIe stream for no gain.
+    if (kv_res > 0 && !E.kv_q8) {
+        std::fprintf(stderr, "strata-q36: --kv-resident needs --kv int8; ignoring it\n");
+        kv_res = 0;
+    }
+    if (kv_res > 0) {
+        const int nres = std::max(kChunkCells, std::min(ctx, kv_res / kChunkCells * kChunkCells));
+        const int nsp = ctx - nres;
+        size_t n_kv = 0;
+        for (const auto& l : m.layers) if (l.attn) ++n_kv;
+        const int n_sess = std::max(1, std::min(batch, Engine::kVerify));
+        // every session spills, so this is the whole pin; the machine has to have the RAM, and pinning is
+        // all-or-nothing, so probe it before committing the cache to the split layout
+        const size_t pin = (size_t) n_sess * n_kv * 2 * m.g.n_head_kv * (size_t) nsp * m.g.head_dim;
+        const size_t one = n_kv * 2 * m.g.n_head_kv * (size_t) nsp * m.g.head_dim;
+        void* probe = nullptr;
+        if (cudaHostAlloc(&probe, pin, cudaHostAllocDefault | cudaHostAllocMapped) != cudaSuccess) probe = nullptr;
+        if (probe) {
+            cudaFreeHost(probe);
+            E.nres = nres;
+            std::fprintf(stderr, "strata-q36: int8 KV: %d cells resident in VRAM, %d spilled to %.2f GiB of pinned host "
+                         "RAM (%d sessions, %.2f GiB of VRAM freed)\n", nres, nsp, pin / 1073741824.0, n_sess,
+                         one / 1073741824.0);
+            // The spill is read by the GPU's own load instructions, and those run at ~240 MB/s of effective bandwidth
+            // on this card, not the ~12 GB/s a DMA copy gets: a decode step reads every cell, so it pays for the whole
+            // spill every token.  A prompt chunk reads it once per chunk in one huge sequential grid, which streams
+            // much better.  Measured at 91k context with 32768 of 131072 cells resident: prefill 76 -> 198 tok/s,
+            // decode 12.7 -> 0.4 tok/s.  Say so, because the flag looks like a pure win.
+            std::fprintf(stderr, "strata-q36: --kv-resident trades decode for prefill: at 91k context it measured "
+                         "198 tok/s prompt (76 fully resident) and 0.4 tok/s generation (12.7 fully resident).  "
+                         "A long prompt with a short answer wins; a chat does not.\n");
+        } else {
+            cudaGetLastError();   // the failed probe leaves an error behind; do not let it poison the next call
+            std::fprintf(stderr, "strata-q36: cannot pin %.2f GiB of host RAM for the KV spill: running fully resident\n",
+                         pin / 1073741824.0);
+        }
+    }
     E.init(m, ctx, chunk, batch, vision);
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
