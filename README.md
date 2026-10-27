@@ -47,6 +47,9 @@ We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where 
 
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
 
+An 8 GB card runs it at a 128K context: the routed experts in pinned host RAM, the KV cache quantised (`--kv k8v4`,
+816 bytes a cell) and the tail of it spilled to RAM (`--kv-resident`), with conversations parked in host RAM.
+
 [Model guide and compatibility](docs/QWEN36.md).
 
 </details>

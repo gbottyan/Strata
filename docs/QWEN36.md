@@ -2,7 +2,7 @@
 
 This page is for people who run [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (35B mixture of
 experts, 3B active, 256 experts, top-8) with Strata and want to know how pictures, parallel requests and the prompt
-chunk behave. For sizes and memory, see [MODELS.md](MODELS.md).
+chunk behave, and how far a small card goes at a long context. For sizes and memory, see [MODELS.md](MODELS.md).
 
 Strata runs [Unsloth's GGUFs with the MTP layer](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0) on its own engine path (`src/qwen35`; `strata` switches to it from the file's
@@ -22,6 +22,9 @@ strata launch --family qwen36 --model ud-q4_k_xl --vision on --parallel 2
 | `--vision on\|off\|gpu\|cpu` | Terminal: pictures and which reader. Source setup uses `--vision yes\|no\|gpu\|cpu` and `--vision-tokens N`. |
 | `--parallel N` | How many requests are answered at once, 1 to 8. Source setup has the same option. |
 | `--prefill 512` | Engine flag in the config's `args`, not a `strata launch` option: the prompt chunk size ([Prompt chunk](#prompt-chunk)). |
+| `--kv int8\|k8v4` | Engine flag in `args`: the cache's size, 1,056 / 816 bytes a cell ([The cache's size](#the-caches-size-kv-int8-and-kv-k8v4)). |
+| `--kv-resident N` | Engine flag in `args`: keep N cells in VRAM and the rest of the cache in pinned host RAM ([The cache's tail](#the-cache-s-tail-kv-resident-n)). |
+| `--conversation-cache-mib N` | Engine flag in `args`: park conversations, with their KV, in host RAM ([Parking a conversation](#parking-a-conversation-conversation-cache-mib-n)). |
 
 ## Pictures
 
@@ -72,8 +75,9 @@ no drafts unless `--batch-mtp` is in the config's `args` (opt-in). Each slot's w
 MTP block made, one per slot, up to the rows to spare in the 8-row window.
 
 **What a slot costs.** Each slot keeps its own cache in VRAM: 1.5 GB at a context of 32K (fp32 keys and values of the 10
-attention layers and the MTP block, 45 KB per token) and 0.07 GB of recurrent state. Setup writes the context for one
-conversation, so N slots take N times that from the room the experts would have. On a card that does not hold every
+attention layers and the MTP block, 45 KB per token) and 0.07 GB of recurrent state. With `--kv int8` / `--kv k8v4` the
+same cache is 14.3 / 11.6 KB a token, 0.45 / 0.36 GB at 32K. Setup writes the context for one conversation, so N slots
+take N times that from the room the experts would have. On a card that does not hold every
 expert (12 and 16 GB, the hybrid mode) the expert slots lose that room, and a batch reads more distinct experts from RAM.
 
 Setup offers `--parallel` where the sessions do not eat the experts' room, says the price in the same breath and asks
@@ -85,6 +89,8 @@ Setup offers `--parallel` where the sessions do not eat the experts' room, says 
 | Hybrid mode | The count whose sessions take at most 35% of the room the experts would have. 12 GB: 4 slots at 8K, none at 32K. 16 GB: 2 slots at 32K. |
 
 The engine says what the sessions take before it allocates them and refuses, with the numbers, a count that cannot fit.
+The table is the fp16 cache's arithmetic; a quantised cache takes a quarter to a third of that room, and setup's offers
+have not been re-measured against it.
 
 In the hybrid mode the text of a request can differ a little between running alone and running beside others. The
 experts that sit on the GPU or on the CPU change with the routing of all the requests, and the two compute with
@@ -118,6 +124,11 @@ Every change on the decode path gives the old kernels' bits. `STRATA_Q36_VERIFY=
 kernel beside each new one on the real activations and compares them bit for bit. `STRATA_Q36_OLD_KERNELS=1` switches
 the new kernels off. Gate/up for Q4_K experts uses the V2K kernels (`STRATA_EXPERT_V2K`, the default on gfx12).
 
+That claim is about the fp16 cache. `--kv int8` and `--kv k8v4` quantise the cache, so they are not bit-exact by
+design: `tools/q36_attn_test.cu` builds a cache the way the engine writes one and compares the attention accumulation
+against a CPU reference, 5.3e-7 relative for int8 at every group size and 6.7e-7 for k8v4. The text of a long
+conversation will differ from the fp16 cache's somewhere.
+
 > **Measured on:** AMD Radeon AI PRO R9700 32 GB (HIP gfx1201), UD-Q4_K_XL, Strata 0.1.45 against the engine before it,
 > 5 interleaved pairs, medians; llama.cpp 972b5fc HIP on the same file (`-fa 1`).
 
@@ -127,6 +138,80 @@ the new kernels off. Gate/up for Q4_K experts uses the V2K kernels (`STRATA_EXPE
 | Prompt pp4096 | 3,453 | 6,220 (chunk 4096) | 3,794 (`-ub 2048`) / 3,042 (`-ub 512`) |
 
 More numbers are in [History](#history--older-measurements).
+
+## Long context on a small card
+
+An 8 GB card runs this model in the hybrid mode: 4.40 GiB of weights in VRAM, all 18.75 GiB of routed experts in pinned
+host RAM. What is left is the context, so the size of the KV cache is most of the game. Four things changed it.
+
+> **Measured on:** GTX 1070 Ti 8 GB (CUDA sm_61, ~256 GB/s), UD-Q4_K_XL, one slot, `--mtp 2`, chunk 512.
+
+### The cache's size: `--kv int8` and `--kv k8v4`
+
+`--kv k8v4` keeps each cell as INT8 keys plus a Hadamard-rotated Q4_0 value: **816 bytes a cell for both heads against
+int8's 1,056**, 11,616 bytes a token against int8's ~14,237 (the engine prints the number at boot). A 128K context is
+1.42 GiB of KV where int8 needs 1.74.
+
+The value's 4-bit block stores its codes only: the fp16 scale lives in a scale table beside the cache, which is where
+both readers - the attention kernel, and the fp16 mirror that feeds the prompt path's PV GEMM - go to read it. That
+makes a head's value row 8 x 16 = 128 bytes and puts every block on a 16-byte boundary, so a thread's byte is one of
+four in an aligned word and a warp's 32 lanes cover one block's codes inside a single sector.
+
+### The cache's tail: `--kv-resident N`
+
+`--kv-resident N` keeps N cells of each attention layer in VRAM and the rest of the cache in pinned host RAM, which the
+attention kernel reads a cell at a time; the freed VRAM goes to the expert staging the engine wants. At 131072 cells
+with N = 32768:
+
+    k8v4 KV: 32768 cells resident in VRAM, 98304 spilled to 0.73 GiB of pinned host RAM (1 sessions, 0.73 GiB of VRAM freed)
+
+and 0.61 GiB free becomes 1.36. The minimum, 20480, frees 0.86 GiB there.
+
+**What is not measured is the spill's cost at the depth it is for.** The runs that checked it decoded a 4,000-token
+prompt (26 tok/s), where every cell being read is resident. The penalty at full depth is unconfirmed.
+
+### Parking a conversation: `--conversation-cache-mib N`
+
+q36 keeps a conversation's state in VRAM, so without this a second conversation wipes the first and reuse is capped at
+one conversation. The cache parks a conversation's KV and its fixed-size recurrent state in host RAM, keyed by token
+ids, least recently used out, and says what it holds:
+
+    conversation cache: 4096 MiB of host RAM, up to 8 conversations. A conversation's running state is 0.06 GiB
+    (fixed: the GDN state is not per token) and its KV 11616 B/token, so one at 131072 tokens is 1.48 GiB and the
+    cache holds about 2 of them; parking evicts the least recently used.
+
+### Attention: the query heads share a block
+
+The attention layers have 8 query heads to every key-value head, and reading K and V once per group of query heads
+instead of once per head is the biggest single win on this card. `STRATA_Q36_GQ` sets the group (2, 4, 8; default 8).
+At 48K, GQ 2 / 4 / 8: attention 15.13 / 12.09 / 11.40 ms a token, decode 19.4 / 20.7 / 20.8 tok/s.
+
+### What it adds up to
+
+> Context 98304, pp96000, tg60, one repetition each. Attention is the profiler's per-token line, two windows, mean.
+
+| | attention ms/token | decode tg60 | prompt pp96000 |
+| --- | ---: | ---: | ---: |
+| int8, GQ 2 (before) | 44.7 | 12.2 tok/s | 164.0 |
+| int8, GQ 2, shared blocks | 28.2 | 15.4 | - |
+| int8, GQ 8 | 20.7 | 16.5 | 163.6 |
+| k8v4, GQ 8 | 20.3 | 17.6 | 163.5 |
+| k8v4, GQ 8, codes-only row | **19.4** | **17.9** | 163.5 |
+
+Prefill did not move: 163.5 tok/s in every mode. And the attention kernel is not reading-bound - at 816 bytes a cell a
+token reads 246 MB of value, 1 ms at 256 GB/s against the 19 measured - so what is left is the loop's own arithmetic
+and the occupancy its 17 KiB of shared memory allows (ptxas: 64 registers, 17,440 bytes, three blocks per SM).
+
+`STRATA_Q36_PROFILE=1 strata ...` prints the stages per token: `attn 19.08, GDN 7.23, experts 25.92, embed 0.01, head
+2.98, MTP draft 0.00 ms/token = 55.87`. The `bench N:` line is ground truth; the windows are one-repetition noisy.
+
+### What fits in 6 GB
+
+The floor is 5.97 GiB at a context of 2,048: 4.40 GiB of weights, and ~1.6 GiB of engine buffers, the MTP draft layer
+and the CUDA context. `--chunk 128` frees 0.18 GiB; `--mtp 0` does not unload the draft layer. A 6 GB card therefore
+fits about **16K of context**, not the 128K this box runs. The build is `CMAKE_CUDA_ARCHITECTURES=61` and embeds sm_61
+PTX, so a Pascal card runs it natively and a Turing card JITs the PTX. The bigger constraint is system RAM: 18.75 GiB
+of pinned experts, plus the parked conversations and any spilled KV.
 
 ## Limits
 
