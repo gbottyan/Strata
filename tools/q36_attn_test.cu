@@ -21,7 +21,7 @@ struct __attribute__((packed)) q4_0_blk {
     uint16_t d;
     uint8_t qs[16];
 };
-constexpr int kV4Blocks = 8, kV4Row = 144;
+constexpr int kV4Code = 16, kV4Blocks = 8, kV4Row = 128;  // codes only: the scale lives in the scale table
 __device__ __forceinline__ float q4_decode(uint8_t byte, int pos, float d) {
     const uint8_t code = pos < 16 ? (byte & 15) : (byte >> 4);
     return ((float) code - 8.0f) * d;
@@ -30,7 +30,7 @@ __device__ __forceinline__ float q4_decode(uint8_t byte, int pos, float d) {
 // reference before the whole accumulation is compared
 __global__ void dump_v4(const uint8_t* vc, const float2* vsc, float* out, int ctx, int kvh, int cell) {
     const int d = threadIdx.x;
-    const uint8_t* vp = vc + ((size_t) kvh * ctx + cell) * kV4Row + (d >> 5) * (int) sizeof(q4_0_blk) + 2 + (d & 15);
+    const uint8_t* vp = vc + ((size_t) kvh * ctx + cell) * kV4Row + (d >> 5) * kV4Code + (d & 15);
     const __half* vsr = (const __half*) vsc + ((size_t) kvh * ctx + cell) * 8 + (d >> 5);
     out[d] = (float) *vp;                       // the raw byte the kernel addresses
     if (d < 8) out[256 + d] = __half2float(*vsr);   // the scale it addresses, for the first eight
@@ -192,14 +192,18 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
             for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
         }
     } else if (V4) {
-        // q4_0: dim j lives in block j/32 at nibble j%32, so what this thread reads per cell is one byte of the
-        // row's 144 and one of its eight scales - a third of what int8's one byte plus 8-byte scale costs.  The
-        // value is rotated, so acc is rotated: the merge transforms the row back.
-        const uint8_t* vp = (const uint8_t*) (res ? vc8 : vc8h) + ((size_t) kvh * stride + (p0 - off)) * kV4Row
-                            + (j >> 5) * (int) sizeof(q4_0_blk) + 2 + (j & 15);   // +2: the codes follow the block's fp16 scale
+        // The row is eight blocks of 16 packed codes, each block on a 16-byte boundary.  A thread's dim lives in
+        // byte (j & 15) of its block, and four neighbouring threads want the same byte, so the cell costs one
+        // 4-byte-aligned word a thread: the warp's 32 lanes cover one block's 16 codes inside a single sector,
+        // where the 18-byte layout put them across two.  The value is rotated, so acc is rotated: the merge
+        // transforms the row back.
+        const uint* wp = reinterpret_cast<const uint*>((const uint8_t*) (res ? vc8 : vc8h)
+                         + ((size_t) kvh * stride + (p0 - off)) * kV4Row + (j >> 5) * kV4Code + ((j & 15) >> 2) * 4);
         const __half* vsr = reinterpret_cast<const __half*>(vsc) + ((size_t) kvh * ctx + p0) * 8 + (j >> 5);
+        const int sh = (j & 3) << 3;
         for (int k = 0; k < n; ++k) {
-            const float v = q4_decode(vp[(size_t) k * kV4Row], j & 31, __half2float(vsr[k * 8]));
+            const uint w = wp[(size_t) k * (kV4Row / 4)];
+            const float v = q4_decode((uint8_t) ((w >> sh) & 0xffu), j & 31, __half2float(vsr[k * 8]));
 #pragma unroll
             for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
         }
@@ -384,9 +388,8 @@ int main() {
                 for (int b = 0; b < kV4Blocks; ++b) {
                     uint8_t qs[16];
                     const uint16_t d = q4_encode_cpu(&row[b * 32], qs);
-                    q4_0_blk* blk = reinterpret_cast<q4_0_blk*>(cell) + b;
-                    blk->d = d;
-                    for (int l = 0; l < 16; ++l) blk->qs[l] = qs[l];
+                    uint8_t* codes = cell + b * kV4Code;   // codes only, each block on a 16-byte boundary
+                    for (int l = 0; l < 16; ++l) codes[l] = qs[l];
                     sc[b] = __ushort_as_half(d);
                     const float dd = __half2float(sc[b]);
                     for (int j = 0; j < 32; ++j) {

@@ -155,7 +155,7 @@ __device__ __forceinline__ float2 kv_params(float lo, float hi) {
 //     sum_p w_p (H v_p) = H (sum_p w_p v_p)
 // so the whole softmax-weighted sum runs in the rotated domain and is transformed back once per row, in the merge.
 // K is left alone - it is scored against an unrotated query, and int8 K is already accurate enough - which is why
-// this mode is the hybrid rather than q4_0 for both: 848 B per cell against int8's 1,160, and no query rotation.
+// this mode is the hybrid rather than q4_0 for both: 816 B per cell against int8's 1,056, and no query rotation.
 #pragma pack(push, 1)
 struct q4_0_blk {
     uint16_t d;      // the fp16 scale, as bits
@@ -163,8 +163,13 @@ struct q4_0_blk {
 };
 #pragma pack(pop)
 static_assert(sizeof(q4_0_blk) == 18, "a q4_0 block is 18 bytes");
-constexpr int kV4Blocks = 256 / 32;                                  // 8 blocks per row of head_dim 256
-constexpr int kV4Row = kV4Blocks * (int) sizeof(q4_0_blk);           // 144 B per head per cell
+// The cache keeps only the codes.  A block's fp16 scale lives in the scale table, which is where both readers go
+// anyway, so the 18-byte block's scale field is dead weight once it is stored: codes alone make a head's row
+// 8 * 16 = 128 bytes, and every block then starts on a 16-byte boundary, which is what lets the attention kernel
+// take a whole 4-byte word per thread per cell instead of one byte.
+constexpr int kV4Code = 16;                                        // the 16 packed codes of one 32-value block
+constexpr int kV4Blocks = 256 / 32;                                // 8 blocks per row of head_dim 256
+constexpr int kV4Row = kV4Blocks * kV4Code;                        // 128 B per head per cell
 
 /// One 32-value block per warp, lane = element: d = (the value of largest |x|) / -8,
 /// q = clamp(trunc(x / d + 8.5), 0, 15).  Ties in |x| resolve to the larger value in EVERY lane, so all 32 lanes
@@ -428,12 +433,9 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
                 const int lane = i & 31, b = i >> 5;
                 uint8_t byte;
                 const uint16_t d = q4_encode(buf[i], lane, byte);
-                q4_0_blk* blk = reinterpret_cast<q4_0_blk*>((res ? vc8 : vc8h) + (size_t) r * kV4Row) + b;
-                if (lane == 0) {
-                    blk->d = d;
-                    reinterpret_cast<__half*>(&vsc[row * 2])[b] = __ushort_as_half(d);
-                }
-                if (lane < 16) blk->qs[lane] = byte;
+                uint8_t* codes = (uint8_t*) (res ? vc8 : vc8h) + (size_t) r * kV4Row + b * kV4Code;
+                if (lane == 0) reinterpret_cast<__half*>(&vsc[row * 2])[b] = __ushort_as_half(d);
+                if (lane < 16) codes[lane] = byte;
                 if (i == 0) ksc[row] = kp;
             } else {
                 const float2 vp = kv_params(block_min(vv, sh), block_max(vv, sh));
@@ -569,14 +571,18 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, in
             for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
         }
     } else if (V4) {
-        // q4_0: dim j lives in block j/32 at nibble j%32, so what this thread reads per cell is one byte of the
-        // row's 144 and one of its eight scales - a third of what int8's one byte plus 8-byte scale costs.  The
-        // value is rotated, so acc is rotated: the merge transforms the row back.
-        const uint8_t* vp = (const uint8_t*) (res ? vc8 : vc8h) + ((size_t) kvh * stride + (p0 - off)) * kV4Row
-                            + (j >> 5) * (int) sizeof(q4_0_blk) + 2 + (j & 15);   // +2: the codes follow the block's fp16 scale
+        // The row is eight blocks of 16 packed codes, each block on a 16-byte boundary.  A thread's dim lives in
+        // byte (j & 15) of its block, and four neighbouring threads want the same byte, so the cell costs one
+        // 4-byte-aligned word a thread: the warp's 32 lanes cover one block's 16 codes inside a single sector,
+        // where the 18-byte layout put them across two.  The value is rotated, so acc is rotated: the merge
+        // transforms the row back.
+        const uint* wp = reinterpret_cast<const uint*>((const uint8_t*) (res ? vc8 : vc8h)
+                         + ((size_t) kvh * stride + (p0 - off)) * kV4Row + (j >> 5) * kV4Code + ((j & 15) >> 2) * 4);
         const __half* vsr = reinterpret_cast<const __half*>(vsc) + ((size_t) kvh * ctx + p0) * 8 + (j >> 5);
+        const int sh = (j & 3) << 3;
         for (int k = 0; k < n; ++k) {
-            const float v = q4_decode(vp[(size_t) k * kV4Row], j & 31, __half2float(vsr[k * 8]));
+            const uint w = wp[(size_t) k * (kV4Row / 4)];
+            const float v = q4_decode((uint8_t) ((w >> sh) & 0xffu), j & 31, __half2float(vsr[k * 8]));
 #pragma unroll
             for (int g = 0; g < GQ; ++g) acc[g] += sc[g][k] * v;
         }
@@ -716,9 +722,9 @@ __global__ void k_kv_f16(const float* kc, const float* vc, int8_t* kc8, int8_t* 
         const size_t row = (size_t) kvh * ctx + cell;   // the scales: one table, wholly in VRAM
         const int8_t* k = res ? kc8 : kc8h;
         k16[i] = __float2half(kv_deq(k[crow * HD + dim], ksc[row].x, ksc[row].y));
-        const uint8_t* v = (const uint8_t*) (res ? vc8 : vc8h) + crow * kV4Row + (dim >> 5) * (int) sizeof(q4_0_blk);
+        const uint8_t* v = (const uint8_t*) (res ? vc8 : vc8h) + crow * kV4Row + (dim >> 5) * kV4Code;
         const __half* vs = reinterpret_cast<const __half*>(vsc) + row * 8;
-        v16[i] = __float2half(q4_decode(v[2 + (dim & 15)], (int) (dim & 31), __half2float(vs[dim >> 5])));
+        v16[i] = __float2half(q4_decode(v[dim & 15], (int) (dim & 31), __half2float(vs[dim >> 5])));
     } else if (Q8) {
         const int64_t cell = rest / HD;   // rest = cell * HD + dim
         const bool res = cell < nres;
@@ -1634,7 +1640,7 @@ struct Engine {
     void alloc_kv(Sess& ss) const {
         const auto& g = m->g;
         const size_t cells = (size_t) g.n_head_kv * ctx;   // rows of the cache: [kvh][ctx], each head_dim wide
-        // k8v4's V rows are q4_0 blocks, 144 bytes of them, and its V scales are eight fp16 per cell - exactly the
+        // k8v4's V rows are q4_0 blocks, 128 bytes of them, and its V scales are eight fp16 per cell - exactly the
         // second float2 of a two-float2 vsc row, which is why vsc is two deep in every mode (int8 uses the first).
         const int vrow = kv_v4 ? kV4Row : (int) g.head_dim;
         const size_t vsc_cells = kv_v4 ? cells * 2 : cells;
@@ -1866,8 +1872,8 @@ struct Engine {
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
             const size_t kv_b = kv_q8 ? 1 : 4;   // the slot's K / V at the context: int8 when --kv int8, fp32 otherwise
-            // k8v4's V rows are 144 bytes of q4_0 rather than head_dim of codes, and its scales are eight fp16 per
-            // cell rather than one (scale, min) pair - 848 B a cell for both heads, against int8's 1,056
+            // k8v4's V rows are 128 bytes of q4_0 rather than head_dim of codes, and its scales are eight fp16 per
+            // cell rather than one (scale, min) pair - 816 B a cell for both heads, against int8's 1,056
             const size_t vbytes = kv_v4 ? (size_t) kV4Row : (size_t) g.head_dim * kv_b;
             const size_t per = (size_t) g.n_head_kv * ((size_t) g.head_dim * kv_b + vbytes) * (size_t) ctx * n_attn +
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn +
@@ -2075,7 +2081,7 @@ struct Engine {
             kv.format = kv_format();
             kv.cells = L; kv.heads = (int64_t) HK; kv.head_dim = (int64_t) HD;
             const size_t row = (size_t) L * HD * esz;
-            // k8v4 parks V as its q4_0 blocks (144 bytes a cell) with eight fp16 scales, not codes and a (scale, min)
+            // k8v4 parks V as its q4_0 blocks (128 bytes a cell) with eight fp16 scales, not codes and a (scale, min)
             // pair, so V travels on its own geometry; the format tag keeps a parked k8v4 cache out of an int8 run
             const size_t vrowb = kv_v4 ? (size_t) kV4Row : HD * esz;
             const size_t vszb = kv_v4 ? 2 * sizeof(float2) : sizeof(float2);
@@ -3465,7 +3471,7 @@ struct Engine {
                     // --kv-resident: the codes are cut at cell nres, so the copy is two 2D copies on two pitches (the
                     // resident part in VRAM, the rest in pinned host memory).  The scales stay in one table at ctx.
                     const int nsp = ctx - nres;
-                    // k8v4's V rows are 144 bytes of q4_0, not head_dim of codes, and its scales are eight fp16 per
+                    // k8v4's V rows are 128 bytes of q4_0, not head_dim of codes, and its scales are eight fp16 per
                     // cell rather than one (scale, min) pair - so V travels on its own pitches
                     const size_t vrow = kv_v4 ? (size_t) kV4Row : (size_t) g.head_dim;
                     const size_t vscb = kv_v4 ? 2 * sizeof(float2) : sizeof(float2);
@@ -4899,7 +4905,7 @@ int strata::qwen35::run(int argc, char** argv) {
         for (const auto& l : m.layers) if (l.attn) ++n_kv;
         const int n_sess = std::max(1, std::min(batch, Engine::kVerify));
         // every session spills, so this is the whole pin; the machine has to have the RAM, and pinning is
-        // all-or-nothing, so probe it before committing the cache to the split layout.  k8v4's V spills 144 bytes a
+        // all-or-nothing, so probe it before committing the cache to the split layout.  k8v4's V spills 128 bytes a
         // cell rather than head_dim of codes.
         const size_t cellb = (size_t) m.g.head_dim + (E.kv_v4 ? (size_t) kV4Row : (size_t) m.g.head_dim);
         const size_t pin = (size_t) n_sess * n_kv * m.g.n_head_kv * (size_t) nsp * cellb;
